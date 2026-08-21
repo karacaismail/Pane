@@ -383,6 +383,32 @@ def _next_item_number(lines):
     return highest + 1
 
 
+def _find_item_block(lines, detect):
+    """Locate the [start, end) line range of the existing numbered item that
+    contains `detect`, plus its item number. Returns None if no such item
+    exists. Used to update a stale item in place instead of appending a
+    duplicate."""
+    pattern = _numbered_item_re()
+    start = None
+    number = None
+    for i, line in enumerate(lines):
+        m = pattern.match(line.lstrip("﻿"))
+        if m:
+            if start is not None:
+                if any(detect in lines[j] for j in range(start, i)):
+                    return start, i, number
+                start = None
+            start = i
+            number = int(m.group(1))
+    if start is not None and any(detect in lines[j] for j in range(start, len(lines))):
+        return start, len(lines), number
+    return None
+
+
+def _render_item(config, template_key, n):
+    return [line.replace("{n}", str(n)) for line in config["projection"][template_key]]
+
+
 def _projection_target_present(config, name, target):
     kind = target["kind"]
     path = target["path"]
@@ -391,7 +417,12 @@ def _projection_target_present(config, name, target):
     detect = config["projection"]["detection_text"]
 
     if kind == "numbered_list_append":
-        return detect in _read_text(path)
+        lines = _read_text(path).splitlines()
+        found = _find_item_block(lines, detect)
+        if found is None:
+            return False
+        start, end, number = found
+        return lines[start:end] == _render_item(config, "item_text_template", number)
 
     if kind == "numbered_list_append_within_markers":
         text = _read_text(path)
@@ -407,7 +438,16 @@ def _projection_target_present(config, name, target):
                 return False
             golden = _read_text(source_path).strip("\n")
             return block == golden and detect in block
-        return detect in text
+        begin, end = target["begin_marker"], target["end_marker"]
+        if begin not in text or end not in text:
+            return False
+        body = text.split(begin, 1)[1].split(end, 1)[0]
+        lines = body.splitlines()
+        found = _find_item_block(lines, detect)
+        if found is None:
+            return False
+        start, end, number = found
+        return lines[start:end] == _render_item(config, "refusal_body_item_template", number)
 
     if kind == "json_body_array_append":
         with open(path, "r") as fh:
@@ -415,8 +455,12 @@ def _projection_target_present(config, name, target):
         node = data
         for key in target["json_path"]:
             node = node.get(key, {})
-        body_text = "\n".join(node) if isinstance(node, list) else ""
-        return detect in body_text
+        body = node if isinstance(node, list) else []
+        found = _find_item_block(body, detect)
+        if found is None:
+            return False
+        start, end, number = found
+        return body[start:end] == _render_item(config, "refusal_body_item_template", number)
 
     if kind == "json_array_append_unique":
         with open(path, "r") as fh:
@@ -472,9 +516,16 @@ def check_projection(config):
 
 
 def _write_numbered_list_append(config, path, template_key):
+    detect = config["projection"]["detection_text"]
     lines = _read_text(path).splitlines()
+    found = _find_item_block(lines, detect)
+    if found is not None:
+        start, end, number = found
+        lines[start:end] = _render_item(config, template_key, number)
+        _write_text(path, "\n".join(lines) + "\n")
+        return
     n = _next_item_number(lines)
-    new_item = [line.replace("{n}", str(n)) for line in config["projection"][template_key]]
+    new_item = _render_item(config, template_key, n)
     text = _read_text(path)
     if not text.endswith("\n"):
         text += "\n"
@@ -505,9 +556,17 @@ def _write_numbered_within_markers(config, target):
         _write_text(path, new_text)
         return
 
+    detect = config["projection"]["detection_text"]
     lines = body.splitlines()
+    found = _find_item_block(lines, detect)
+    if found is not None:
+        start, end, number = found
+        lines[start:end] = _render_item(config, "refusal_body_item_template", number)
+        new_body = "\n".join(lines) + "\n"
+        _write_text(path, head + begin + new_body + end + tail)
+        return
     n = _next_item_number(lines)
-    new_item = [line.replace("{n}", str(n)) for line in config["projection"]["refusal_body_item_template"]]
+    new_item = _render_item(config, "refusal_body_item_template", n)
     new_body = body.rstrip("\n") + "\n" + "\n".join(new_item) + "\n"
     _write_text(path, head + begin + new_body + end + tail)
 
@@ -521,9 +580,16 @@ def _write_json_body_array_append(config, target):
         node = node[key]
     array_key = target["json_path"][-1]
     body = node[array_key]
-    n = _next_item_number(body)
-    new_item = [line.replace("{n}", str(n)) for line in config["projection"]["refusal_body_item_template"]]
-    node[array_key] = body + new_item
+    detect = config["projection"]["detection_text"]
+    found = _find_item_block(body, detect)
+    if found is not None:
+        start, end, number = found
+        body[start:end] = _render_item(config, "refusal_body_item_template", number)
+        node[array_key] = body
+    else:
+        n = _next_item_number(body)
+        new_item = _render_item(config, "refusal_body_item_template", n)
+        node[array_key] = body + new_item
     with open(path, "w") as fh:
         json.dump(data, fh, indent=2)
         fh.write("\n")
