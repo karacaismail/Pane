@@ -820,6 +820,114 @@ class ProjectionApplyTests(ProjectionFixtureMixin, unittest.TestCase):
             tool.apply_projection(self.config)
             sock.assert_not_called()
 
+    def test_stale_item_is_updated_in_place_not_duplicate_appended(self):
+        # Simulate an earlier projection wave having already appended an
+        # item whose text is now stale (e.g. repoHandshakePrepared flipped
+        # true with new evidence). A re-apply must rewrite that existing
+        # numbered item in place, not append a second duplicate item.
+        stale_item = [
+            "19. **Claude child-session broker is prepared, not active.**",
+            "   stale text from a prior wave.",
+        ]
+        self.agents_doc.write_text(
+            self.agents_doc.read_text().rstrip("\n") + "\n" + "\n".join(stale_item) + "\n"
+        )
+        self.config["projection"]["targets"]["provider_lock_agents"]["expected_prehash_sha256"] = (
+            tool.sha256_text(self.agents_doc.read_text())
+        )
+
+        result = tool.apply_projection(self.config)
+        self.assertEqual(result["status"], "GREEN")
+        self.assertTrue(result["changed"])
+
+        text = self.agents_doc.read_text()
+        self.assertEqual(text.count("Claude child-session broker is prepared, not active"), 1)
+        self.assertIn("19. **Claude child-session broker is prepared, not active.**", text)
+        self.assertNotIn("stale text from a prior wave.", text)
+        self.assertNotIn("20. **Claude child-session broker", text)
+
+        check_result = tool.check_projection(self.config)
+        self.assertEqual(check_result["status"], "GREEN")
+
+    def test_second_apply_after_upsert_is_still_noop(self):
+        stale_item = [
+            "19. **Claude child-session broker is prepared, not active.**",
+            "   stale text from a prior wave.",
+        ]
+        self.agents_doc.write_text(
+            self.agents_doc.read_text().rstrip("\n") + "\n" + "\n".join(stale_item) + "\n"
+        )
+        self.config["projection"]["targets"]["provider_lock_agents"]["expected_prehash_sha256"] = (
+            tool.sha256_text(self.agents_doc.read_text())
+        )
+
+        tool.apply_projection(self.config)
+        result = tool.apply_projection(self.config)
+        self.assertEqual(result["status"], "GREEN")
+        self.assertFalse(result["changed"])
+
+
+class RealSnapshotPrehashTests(unittest.TestCase):
+    """Regression coverage for the successor package: the recorded
+    expected_prehash_sha256 values in the real disabled-child-broker.json
+    must match the current on-disk state of every real target (both the
+    POLICY-54 surfaces and both projection manifest phases), and the
+    fail-closed drift check must still reject a value that doesn't match."""
+
+    def setUp(self):
+        self.config = tool.load_config(tool.DEFAULT_CONFIG)
+
+    def _live_targets(self):
+        targets = dict(self.config["surfaces"])
+        targets["projection_manifest"] = self.config["projection"]["manifest"]
+        for name, t in self.config["projection"]["targets"].items():
+            if "expected_prehash_sha256" in t:
+                targets[f"projection_{name}"] = t
+        return targets
+
+    def test_recorded_prehashes_match_current_live_targets(self):
+        mismatches = []
+        for name, surf in self._live_targets().items():
+            path = surf["path"]
+            if not os.path.exists(path):
+                mismatches.append(f"{name}: missing at {path}")
+                continue
+            actual = tool.sha256_text(tool._read_text(path))
+            if actual != surf["expected_prehash_sha256"]:
+                mismatches.append(f"{name}: expected {surf['expected_prehash_sha256']}, found {actual}")
+        self.assertEqual(mismatches, [], "; ".join(mismatches))
+
+    def test_both_manifest_phases_share_the_same_live_hash(self):
+        # surfaces.manifest and projection.manifest point at the same real
+        # GOLDEN.sha256 file; both recorded prehashes must agree with each
+        # other and with the file's current hash.
+        surf_manifest = self.config["surfaces"]["manifest"]
+        proj_manifest = self.config["projection"]["manifest"]
+        self.assertEqual(surf_manifest["path"], proj_manifest["path"])
+        self.assertEqual(
+            surf_manifest["expected_prehash_sha256"],
+            proj_manifest["expected_prehash_sha256"],
+        )
+        actual = tool.sha256_text(tool._read_text(surf_manifest["path"]))
+        self.assertEqual(actual, surf_manifest["expected_prehash_sha256"])
+
+    def test_apply_still_fail_closed_refuses_on_injected_drift(self):
+        # Prove the successor snapshot doesn't just happen to pass -- a
+        # deliberately wrong prehash on a real surface must still be
+        # refused before any write, with zero side effects.
+        drifted = json.loads(json.dumps(self.config))
+        drifted["surfaces"]["canonical"]["expected_prehash_sha256"] = "0" * 64
+        with self.assertRaises(tool.PrehashMismatch):
+            tool.apply(drifted)
+
+    def test_disabled_posture_and_non_goals_preserved(self):
+        obj = self.config["claude_child_broker_object"]
+        self.assertFalse(obj["active"])
+        self.assertEqual(obj["defaultDecision"], "DENY")
+        self.assertEqual(obj["authorizedCreators"], ["codex-desktop-master"])
+        for field in self.config["must_be_false_fields"]:
+            self.assertFalse(obj[field], f"{field} must stay false")
+
 
 if __name__ == "__main__":
     unittest.main()
