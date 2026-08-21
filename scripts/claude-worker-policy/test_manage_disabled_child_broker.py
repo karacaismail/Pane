@@ -267,6 +267,14 @@ class FixtureMixin:
                 },
             },
             "backup_dir": str(self.backup_dir),
+            # Minimal stub so tool.main()'s combined check (broker + projection)
+            # doesn't KeyError for fixtures that only exercise the broker wave.
+            "projection": {
+                "marker": "unused-in-broker-wave-fixtures",
+                "detection_text": "unused-in-broker-wave-fixtures",
+                "targets": {},
+                "manifest": {"path": os.path.join(self.tmp.name, "nonexistent-projection-manifest")},
+            },
         }
 
 
@@ -471,6 +479,346 @@ class ApplyModeTests(FixtureMixin, unittest.TestCase):
         with self.assertRaises(tool.PolicyRefused):
             tool.apply(self.config)
         self.assertFalse(self.backup_dir.exists())
+
+
+PROVIDER_LOCK_FIXTURE = (
+    "# Provider lock (agents)\n\n"
+    "17. Item seventeen text, unrelated to the broker.\n"
+    "18. The Pane Codex Orkestra Sefi is recorded, not active.\n"
+)
+
+MANAGED_FIELDS_FIXTURE = {
+    "claudeRefusalBlock": {
+        "path": "/fixture/CLAUDE.md",
+        "body": [
+            "## Claude Invocation Routing",
+            "",
+            "10. Some earlier item.",
+            "11. The Pane Codex Orkestra Sefi is recorded but disabled:",
+            "    details continue here.",
+        ],
+    },
+    "launchd": {
+        "requiredWatchPaths": [
+            "/fixture/AGENTS.md",
+            "/fixture/CLAUDE.md",
+        ]
+    },
+}
+
+LIVE_CLAUDE_MD_FIXTURE = (
+    "# Claude Code — Global Managed Directives\n\n"
+    "<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:BEGIN -->\n"
+    "## Claude Invocation Routing\n\n"
+    "10. Some earlier item.\n"
+    "11. The Pane Codex Orkestra Sefi is recorded but disabled:\n"
+    "    details continue here.\n"
+    "<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:END -->\n"
+)
+
+PLIST_FIXTURE = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<plist version="1.0">\n<dict>\n'
+    "\t<key>WatchPaths</key>\n\t<array>\n"
+    "\t\t<string>/fixture/AGENTS.md</string>\n"
+    "\t</array>\n"
+    "</dict>\n</plist>\n"
+)
+
+
+class ProjectionFixtureMixin:
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = pathlib.Path(self.tmp.name)
+
+        self.agents_doc = root / "provider-lock-agents.md"
+        self.agents_doc.write_text(PROVIDER_LOCK_FIXTURE)
+
+        self.orch_doc = root / "provider-lock-orchestrator.md"
+        self.orch_doc.write_text(PROVIDER_LOCK_FIXTURE.replace("agents", "orchestrator"))
+
+        self.managed_fields = root / "managed-fields.golden.json"
+        self.managed_fields.write_text(json.dumps(MANAGED_FIELDS_FIXTURE, indent=2))
+
+        self.live_claude_md = root / "CLAUDE.md"
+        self.live_claude_md.write_text(LIVE_CLAUDE_MD_FIXTURE)
+
+        # These live docs start with a lock block that is byte-identical to
+        # the golden provider-lock file's *pre-apply* content, mirroring the
+        # real repo where AGENTS.md/runpane-orchestrator.md carry the golden
+        # provider-lock text verbatim between CLAUDE-WORKER-PROVIDER-LOCK
+        # markers.
+        self.live_agents_md = root / "AGENTS.md"
+        self.live_agents_md.write_text(
+            "# Codex AGENTS.md fixture\n\n"
+            "<!-- CLAUDE-WORKER-PROVIDER-LOCK:BEGIN -->\n\n"
+            + PROVIDER_LOCK_FIXTURE.strip("\n")
+            + "\n\n<!-- CLAUDE-WORKER-PROVIDER-LOCK:END -->\n\n"
+            "Tail content below the lock block.\n"
+        )
+
+        self.live_orchestrator_md = root / "runpane-orchestrator.md"
+        self.live_orchestrator_md.write_text(
+            "# runpane orchestrator fixture\n\n"
+            "<!-- CLAUDE-WORKER-PROVIDER-LOCK:BEGIN -->\n\n"
+            + PROVIDER_LOCK_FIXTURE.replace("agents", "orchestrator").strip("\n")
+            + "\n\n<!-- CLAUDE-WORKER-PROVIDER-LOCK:END -->\n\n"
+            "Tail content below the lock block.\n"
+        )
+
+        self.plist_path = root / "com.codex.claude-worker-policy.plist"
+        self.plist_path.write_text(PLIST_FIXTURE)
+
+        self.manifest_path = root / "GOLDEN.sha256"
+        self.manifest_path.write_text(
+            f"# fixture manifest\n"
+            f"{tool.sha256_file(self.agents_doc)}  provider-lock-agents.md\n"
+            f"{tool.sha256_file(self.orch_doc)}  provider-lock-orchestrator.md\n"
+            f"{tool.sha256_file(self.managed_fields)}  managed-fields.golden.json\n"
+            f"dddd  some-other-file.json\n"
+        )
+
+        self.backup_dir = root / "rollback"
+
+        item_text_template = [
+            "{n}. **Claude child-session broker is prepared, not active.**",
+            "   activation remains a non-goal.",
+        ]
+        refusal_body_item_template = [
+            "{n}. **Claude child-session broker is prepared, not active.**",
+            "    activation remains a non-goal.",
+        ]
+        self.config = {
+            "schemaVersion": 4,
+            "projection": {
+                "marker": "claude-child-broker-prepared-not-active-projection-m4",
+                "detection_text": "Claude child-session broker is prepared, not active",
+                "item_text_template": item_text_template,
+                "refusal_body_item_template": refusal_body_item_template,
+                "watch_path_value": "/fixture/claude_child_broker.py",
+                "targets": {
+                    "provider_lock_agents": {
+                        "kind": "numbered_list_append",
+                        "path": str(self.agents_doc),
+                        "manifest_name": "provider-lock-agents.md",
+                        "expected_prehash_sha256": tool.sha256_text(self.agents_doc.read_text()),
+                    },
+                    "provider_lock_orchestrator": {
+                        "kind": "numbered_list_append",
+                        "path": str(self.orch_doc),
+                        "manifest_name": "provider-lock-orchestrator.md",
+                        "expected_prehash_sha256": tool.sha256_text(self.orch_doc.read_text()),
+                    },
+                    "managed_fields_refusal": {
+                        "kind": "json_body_array_append",
+                        "path": str(self.managed_fields),
+                        "json_path": ["claudeRefusalBlock", "body"],
+                        "manifest_name": "managed-fields.golden.json",
+                        "expected_prehash_sha256": tool.sha256_text(self.managed_fields.read_text()),
+                    },
+                    "managed_fields_watchpaths": {
+                        "kind": "json_array_append_unique",
+                        "path": str(self.managed_fields),
+                        "json_path": ["launchd", "requiredWatchPaths"],
+                        "manifest_name": "managed-fields.golden.json",
+                        "expected_prehash_sha256": tool.sha256_text(self.managed_fields.read_text()),
+                    },
+                    "live_claude_md": {
+                        "kind": "numbered_list_append_within_markers",
+                        "path": str(self.live_claude_md),
+                        "begin_marker": "<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:BEGIN -->",
+                        "end_marker": "<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:END -->",
+                        "expected_prehash_sha256": tool.sha256_text(self.live_claude_md.read_text()),
+                    },
+                    "live_agents_md": {
+                        "kind": "numbered_list_append_within_markers",
+                        "path": str(self.live_agents_md),
+                        "begin_marker": "<!-- CLAUDE-WORKER-PROVIDER-LOCK:BEGIN -->",
+                        "end_marker": "<!-- CLAUDE-WORKER-PROVIDER-LOCK:END -->",
+                        "source_path": str(self.agents_doc),
+                        "expected_prehash_sha256": tool.sha256_text(self.live_agents_md.read_text()),
+                    },
+                    "live_runpane_orchestrator_md": {
+                        "kind": "numbered_list_append_within_markers",
+                        "path": str(self.live_orchestrator_md),
+                        "begin_marker": "<!-- CLAUDE-WORKER-PROVIDER-LOCK:BEGIN -->",
+                        "end_marker": "<!-- CLAUDE-WORKER-PROVIDER-LOCK:END -->",
+                        "source_path": str(self.orch_doc),
+                        "expected_prehash_sha256": tool.sha256_text(self.live_orchestrator_md.read_text()),
+                    },
+                    "launch_agent_plist": {
+                        "kind": "plist_watchpath_append",
+                        "path": str(self.plist_path),
+                        "expected_prehash_sha256": tool.sha256_text(self.plist_path.read_text()),
+                    },
+                },
+                "manifest": {
+                    "path": str(self.manifest_path),
+                    "expected_prehash_sha256": tool.sha256_text(self.manifest_path.read_text()),
+                    "updatable_entries": [
+                        "provider-lock-agents.md",
+                        "provider-lock-orchestrator.md",
+                        "managed-fields.golden.json",
+                    ],
+                },
+                "backup_dir": str(self.backup_dir),
+            },
+        }
+
+
+class ProjectionCheckTests(ProjectionFixtureMixin, unittest.TestCase):
+    def test_check_reports_red_before_projection(self):
+        result = tool.check_projection(self.config)
+        self.assertEqual(result["status"], "RED")
+        self.assertFalse(result["targets"]["provider_lock_agents"])
+        self.assertFalse(result["targets"]["live_agents_md"])
+        self.assertFalse(result["targets"]["launch_agent_plist"])
+
+    def test_check_makes_zero_writes(self):
+        before = {
+            "agents_doc": self.agents_doc.read_text(),
+            "orch_doc": self.orch_doc.read_text(),
+            "managed_fields": self.managed_fields.read_text(),
+            "live_claude_md": self.live_claude_md.read_text(),
+            "live_agents_md": self.live_agents_md.read_text(),
+            "plist": self.plist_path.read_text(),
+        }
+        tool.check_projection(self.config)
+        after = {
+            "agents_doc": self.agents_doc.read_text(),
+            "orch_doc": self.orch_doc.read_text(),
+            "managed_fields": self.managed_fields.read_text(),
+            "live_claude_md": self.live_claude_md.read_text(),
+            "live_agents_md": self.live_agents_md.read_text(),
+            "plist": self.plist_path.read_text(),
+        }
+        self.assertEqual(before, after)
+        self.assertFalse(self.backup_dir.exists())
+
+    def test_check_never_spawns_subprocess_or_network(self):
+        with mock.patch.object(subprocess, "run") as run, \
+                mock.patch("socket.socket") as sock:
+            tool.check_projection(self.config)
+            run.assert_not_called()
+            sock.assert_not_called()
+
+
+class ProjectionApplyTests(ProjectionFixtureMixin, unittest.TestCase):
+    def test_apply_projection_is_green_and_writes_next_sequential_item(self):
+        result = tool.apply_projection(self.config)
+        self.assertEqual(result["status"], "GREEN")
+        self.assertTrue(result["changed"])
+
+        agents_text = self.agents_doc.read_text()
+        self.assertIn("19. **Claude child-session broker", agents_text)
+        orch_text = self.orch_doc.read_text()
+        self.assertIn("19. **Claude child-session broker", orch_text)
+
+        data = json.loads(self.managed_fields.read_text())
+        body_text = "\n".join(data["claudeRefusalBlock"]["body"])
+        self.assertIn("12. **Claude child-session broker", body_text)
+        self.assertIn("/fixture/claude_child_broker.py", data["launchd"]["requiredWatchPaths"])
+
+        live_claude_text = self.live_claude_md.read_text()
+        self.assertIn("12. **Claude child-session broker", live_claude_text)
+        self.assertTrue(live_claude_text.index("12. **Claude") < live_claude_text.index("LOCK:END"))
+
+        # The two live docs' lock blocks must be inside the EXISTING
+        # CLAUDE-WORKER-PROVIDER-LOCK markers and byte-for-byte identical to
+        # the just-updated golden provider-lock file -- no separate marker
+        # block left anywhere outside those markers.
+        def lock_block(text):
+            return text.split("<!-- CLAUDE-WORKER-PROVIDER-LOCK:BEGIN -->", 1)[1].split(
+                "<!-- CLAUDE-WORKER-PROVIDER-LOCK:END -->", 1
+            )[0].strip("\n")
+
+        live_agents_text = self.live_agents_md.read_text()
+        self.assertEqual(lock_block(live_agents_text), agents_text.strip("\n"))
+        self.assertEqual(live_agents_text.count("CLAUDE-WORKER-PROVIDER-LOCK:BEGIN"), 1)
+        self.assertNotIn(self.config["projection"]["marker"], live_agents_text)
+
+        live_orch_text = self.live_orchestrator_md.read_text()
+        self.assertEqual(lock_block(live_orch_text), orch_text.strip("\n"))
+        self.assertEqual(live_orch_text.count("CLAUDE-WORKER-PROVIDER-LOCK:BEGIN"), 1)
+        self.assertNotIn(self.config["projection"]["marker"], live_orch_text)
+
+        plist_text = self.plist_path.read_text()
+        self.assertIn("<string>/fixture/claude_child_broker.py</string>", plist_text)
+
+        check_result = tool.check_projection(self.config)
+        self.assertEqual(check_result["status"], "GREEN")
+
+    def test_second_apply_projection_is_noop_no_duplicate_backup(self):
+        tool.apply_projection(self.config)
+        first = sorted(os.listdir(self.backup_dir))
+        self.assertEqual(len(first), 1)
+
+        result = tool.apply_projection(self.config)
+        self.assertEqual(result["status"], "GREEN")
+        self.assertFalse(result["changed"])
+        second = sorted(os.listdir(self.backup_dir))
+        self.assertEqual(first, second)
+
+    def test_apply_projection_refuses_prehash_mismatch_with_zero_writes(self):
+        self.agents_doc.write_text(PROVIDER_LOCK_FIXTURE + "\ndrift\n")
+        with self.assertRaises(tool.PrehashMismatch):
+            tool.apply_projection(self.config)
+        self.assertFalse(self.backup_dir.exists())
+
+    def test_apply_projection_refuses_plist_prehash_mismatch_with_zero_writes(self):
+        # The plist is exactly as fail-closed as every other target: if it
+        # drifted from its recorded baseline, apply_projection refuses
+        # before touching anything, including targets that hadn't drifted.
+        self.plist_path.write_text(PLIST_FIXTURE.replace("</array>", "\t<string>/tampered</string>\n\t</array>"))
+        original = {
+            "agents_doc": self.agents_doc.read_text(),
+            "orch_doc": self.orch_doc.read_text(),
+            "managed_fields": self.managed_fields.read_text(),
+        }
+        with self.assertRaises(tool.PrehashMismatch):
+            tool.apply_projection(self.config)
+        self.assertFalse(self.backup_dir.exists())
+        self.assertEqual(self.agents_doc.read_text(), original["agents_doc"])
+        self.assertEqual(self.orch_doc.read_text(), original["orch_doc"])
+        self.assertEqual(self.managed_fields.read_text(), original["managed_fields"])
+
+    def test_apply_projection_rollback_restores_all_targets_on_failure(self):
+        original = {
+            "agents_doc": self.agents_doc.read_text(),
+            "orch_doc": self.orch_doc.read_text(),
+            "managed_fields": self.managed_fields.read_text(),
+            "live_claude_md": self.live_claude_md.read_text(),
+            "live_agents_md": self.live_agents_md.read_text(),
+            "live_orchestrator_md": self.live_orchestrator_md.read_text(),
+            "plist": self.plist_path.read_text(),
+            "manifest": self.manifest_path.read_text(),
+        }
+        with mock.patch.object(tool, "_update_projection_manifest", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                tool.apply_projection(self.config)
+        after = {
+            "agents_doc": self.agents_doc.read_text(),
+            "orch_doc": self.orch_doc.read_text(),
+            "managed_fields": self.managed_fields.read_text(),
+            "live_claude_md": self.live_claude_md.read_text(),
+            "live_agents_md": self.live_agents_md.read_text(),
+            "live_orchestrator_md": self.live_orchestrator_md.read_text(),
+            "plist": self.plist_path.read_text(),
+            "manifest": self.manifest_path.read_text(),
+        }
+        self.assertEqual(original, after)
+
+    def test_apply_projection_updates_only_allowed_manifest_entries(self):
+        tool.apply_projection(self.config)
+        lines = self.manifest_path.read_text().splitlines()
+        other_line = [l for l in lines if "some-other-file.json" in l][0]
+        self.assertTrue(other_line.startswith("dddd"))
+
+    def test_apply_projection_never_uses_network(self):
+        with mock.patch("socket.socket") as sock:
+            tool.apply_projection(self.config)
+            sock.assert_not_called()
 
 
 if __name__ == "__main__":
