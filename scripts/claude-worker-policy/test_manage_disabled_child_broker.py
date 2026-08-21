@@ -926,6 +926,35 @@ class ProjectionApplyTests(ProjectionFixtureMixin, unittest.TestCase):
         check_result = tool.check_projection(self.config)
         self.assertEqual(check_result["status"], "GREEN")
 
+    def test_find_item_block_excludes_trailing_blank_lines_before_end_marker(self):
+        # Regression: when the last numbered item runs to the end of the
+        # marker body, _find_item_block must not swallow trailing blank
+        # lines between that item and the end marker into the item block --
+        # only the item's own real content lines belong to the block.
+        lines = [
+            "## header",
+            "",
+            "11. **Claude child-session broker is prepared, not active.**",
+            "    detail continues here.",
+            "",
+            "",
+        ]
+        found = tool._find_item_block(
+            lines, "Claude child-session broker is prepared, not active"
+        )
+        self.assertIsNotNone(found)
+        start, end, number = found
+        self.assertEqual(number, 11)
+        self.assertEqual(
+            lines[start:end],
+            [
+                "11. **Claude child-session broker is prepared, not active.**",
+                "    detail continues here.",
+            ],
+        )
+        # The trailing blank lines must remain outside the block, untouched.
+        self.assertEqual(lines[end:], ["", ""])
+
     def test_stale_item_within_markers_non_source_mode_replaces_in_place(self):
         # Regression for manage-disabled-child-broker.py:566 -- a prior
         # `_write_numbered_within_markers` reused `end` as both the marker
