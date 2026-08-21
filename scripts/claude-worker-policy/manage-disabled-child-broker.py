@@ -288,6 +288,38 @@ def _bounded_diagnostic(text, max_chars=_VERIFIER_DIAGNOSTIC_MAX_CHARS):
     return f"...[truncated to last {max_chars} chars]...\n" + text[-max_chars:]
 
 
+def _bounded_stdout_diagnostic(text, max_chars=_VERIFIER_DIAGNOSTIC_MAX_CHARS):
+    """Like _bounded_diagnostic, but a real verifier's own [FAIL] lines are
+    the whole point of the message -- a plain tail truncation can bury one
+    under thousands of later [PASS] lines. When truncation is needed, every
+    "[FAIL]" line is kept in full (itself tail-bounded if pathologically
+    numerous/long), with any remaining budget filled by the plain tail for
+    surrounding context."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+
+    fail_lines = [line for line in text.splitlines() if "[FAIL]" in line]
+    if not fail_lines:
+        return _bounded_diagnostic(text, max_chars)
+
+    fail_block = "\n".join(fail_lines)
+    if len(fail_block) > max_chars:
+        return f"...[truncated to last {max_chars} chars of [FAIL] lines]...\n" + fail_block[-max_chars:]
+
+    header = f"[FAIL] lines ({len(fail_lines)}):\n"
+    remaining = max_chars - len(header) - len(fail_block)
+    if remaining <= 0:
+        return header + fail_block
+
+    tail_marker = "\n...[tail]...\n"
+    tail_budget = remaining - len(tail_marker)
+    if tail_budget <= 0:
+        return header + fail_block
+
+    return header + fail_block + tail_marker + text[-tail_budget:]
+
+
 def _run_verifier_readonly(config):
     path = config["surfaces"]["verifier"]["path"]
     result = subprocess.run(
@@ -296,7 +328,7 @@ def _run_verifier_readonly(config):
         text=True,
     )
     if result.returncode != 0:
-        stdout = _bounded_diagnostic(result.stdout)
+        stdout = _bounded_stdout_diagnostic(result.stdout)
         stderr = _bounded_diagnostic(result.stderr)
         parts = [f"verifier {path} exited {result.returncode}"]
         if stdout:
