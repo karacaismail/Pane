@@ -929,5 +929,170 @@ class RealSnapshotPrehashTests(unittest.TestCase):
             self.assertFalse(obj[field], f"{field} must stay false")
 
 
+class ApplyAllFixtureMixin(FixtureMixin, ProjectionFixtureMixin):
+    def setUp(self):
+        FixtureMixin.setUp(self)
+        broker_config = self.config
+
+        ProjectionFixtureMixin.setUp(self)
+        projection_config = self.config["projection"]
+
+        # Both waves must share exactly one GOLDEN.sha256 file so apply_all
+        # exercises the real shared-manifest path.
+        shared_manifest_path = pathlib.Path(broker_config["surfaces"]["manifest"]["path"])
+        shared_manifest_path.write_text(
+            "# fixture manifest\n"
+            f"{tool.sha256_file(pathlib.Path(broker_config['surfaces']['verifier']['path']))}"
+            "  verify_worker_policy.py\n"
+            f"{tool.sha256_file(pathlib.Path(broker_config['surfaces']['golden']['path']))}"
+            "  claude-worker-policy.golden.json\n"
+            f"{tool.sha256_file(self.agents_doc)}  provider-lock-agents.md\n"
+            f"{tool.sha256_file(self.orch_doc)}  provider-lock-orchestrator.md\n"
+            f"{tool.sha256_file(self.managed_fields)}  managed-fields.golden.json\n"
+            "eeee  some-other-file.json\n"
+        )
+        shared_hash = tool.sha256_text(shared_manifest_path.read_text())
+
+        broker_config["surfaces"]["manifest"]["path"] = str(shared_manifest_path)
+        broker_config["surfaces"]["manifest"]["expected_prehash_sha256"] = shared_hash
+        broker_config["backup_dir"] = str(self.backup_dir)
+
+        projection_config["manifest"]["path"] = str(shared_manifest_path)
+        projection_config["manifest"]["expected_prehash_sha256"] = shared_hash
+
+        self.config = dict(broker_config)
+        self.config["projection"] = projection_config
+        self.manifest_path = shared_manifest_path
+
+
+class ApplyAllTests(ApplyAllFixtureMixin, unittest.TestCase):
+    def test_apply_all_is_green_and_integrates_both_waves_from_one_snapshot(self):
+        result = tool.apply_all(self.config)
+        self.assertEqual(result["status"], "GREEN")
+        self.assertTrue(result["changed"])
+
+        canonical = json.loads(self.canonical_path.read_text())
+        self.assertEqual(canonical["claudeChildBroker"], self.expected_obj)
+
+        agents_text = self.agents_doc.read_text()
+        self.assertIn("19. **Claude child-session broker", agents_text)
+        plist_text = self.plist_path.read_text()
+        self.assertIn("<string>/fixture/claude_child_broker.py</string>", plist_text)
+
+        self.assertEqual(tool.check(self.config)["status"], "GREEN")
+        self.assertEqual(tool.check_projection(self.config)["status"], "GREEN")
+
+    def test_apply_all_uses_one_backup_directory_for_the_union(self):
+        tool.apply_all(self.config)
+        entries = os.listdir(self.backup_dir)
+        self.assertEqual(len(entries), 1)
+        txn_dir = pathlib.Path(self.backup_dir) / entries[0]
+        backed_up_names = set(os.listdir(txn_dir))
+        # exactly one backup of the shared manifest, not two
+        manifest_backups = [n for n in backed_up_names if "manifest" in n]
+        self.assertEqual(len(manifest_backups), 1)
+
+    def test_apply_all_refuses_shared_manifest_hash_inconsistency(self):
+        self.config["projection"]["manifest"]["expected_prehash_sha256"] = "0" * 64
+        with self.assertRaises(tool.PolicyRefused):
+            tool.apply_all(self.config)
+        self.assertFalse(os.path.exists(self.backup_dir))
+
+    def test_apply_all_refuses_drift_before_any_side_effect(self):
+        self.agents_doc.write_text(PROVIDER_LOCK_FIXTURE + "\ndrift\n")
+        original_canonical = self.canonical_path.read_text()
+        with self.assertRaises(tool.PrehashMismatch):
+            tool.apply_all(self.config)
+        self.assertFalse(os.path.exists(self.backup_dir))
+        self.assertEqual(self.canonical_path.read_text(), original_canonical)
+
+    def test_apply_all_refuses_enabling_posture_before_any_side_effect(self):
+        bad_obj = dict(self.expected_obj, active=True)
+        self.config["claude_child_broker_object"] = bad_obj
+        with self.assertRaises(tool.PolicyRefused):
+            tool.apply_all(self.config)
+        self.assertFalse(os.path.exists(self.backup_dir))
+        self.assertNotIn("claudeChildBroker", json.loads(self.canonical_path.read_text()))
+
+    def test_apply_all_late_failure_restores_every_union_target(self):
+        original = {
+            "canonical": self.canonical_path.read_text(),
+            "golden": self.golden_path.read_text(),
+            "verifier": self.verifier_path.read_text(),
+            "manifest": self.manifest_path.read_text(),
+            "agents_doc": self.agents_doc.read_text(),
+            "orch_doc": self.orch_doc.read_text(),
+            "managed_fields": self.managed_fields.read_text(),
+            "plist": self.plist_path.read_text(),
+        }
+        with mock.patch.object(tool, "_update_manifest_all", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                tool.apply_all(self.config)
+        after = {
+            "canonical": self.canonical_path.read_text(),
+            "golden": self.golden_path.read_text(),
+            "verifier": self.verifier_path.read_text(),
+            "manifest": self.manifest_path.read_text(),
+            "agents_doc": self.agents_doc.read_text(),
+            "orch_doc": self.orch_doc.read_text(),
+            "managed_fields": self.managed_fields.read_text(),
+            "plist": self.plist_path.read_text(),
+        }
+        self.assertEqual(original, after)
+        # only one backup attempt occurred despite the rollback
+        self.assertEqual(len(os.listdir(self.backup_dir)), 1)
+
+    def test_apply_all_runs_verifier_exactly_once_after_final_manifest(self):
+        with mock.patch.object(tool, "_run_verifier_readonly", wraps=tool._run_verifier_readonly) as spy:
+            tool.apply_all(self.config)
+            spy.assert_called_once()
+        manifest_text = self.manifest_path.read_text()
+        self.assertIn(tool.sha256_file(self.verifier_path), manifest_text)
+        self.assertIn(tool.sha256_file(self.agents_doc), manifest_text)
+
+    def test_second_apply_all_is_noop_no_backup_no_write(self):
+        tool.apply_all(self.config)
+        before = {
+            "canonical": self.canonical_path.read_text(),
+            "agents_doc": self.agents_doc.read_text(),
+        }
+        backups_first = sorted(os.listdir(self.backup_dir))
+
+        result = tool.apply_all(self.config)
+        self.assertEqual(result["status"], "GREEN")
+        self.assertFalse(result["changed"])
+
+        after = {
+            "canonical": self.canonical_path.read_text(),
+            "agents_doc": self.agents_doc.read_text(),
+        }
+        self.assertEqual(before, after)
+        self.assertEqual(backups_first, sorted(os.listdir(self.backup_dir)))
+
+    def test_apply_and_apply_projection_remain_compatible_after_apply_all_added(self):
+        # apply() alone still integrates just the broker wave without
+        # touching projection targets.
+        broker_only_config = dict(self.config)
+        result = tool.apply(broker_only_config)
+        self.assertEqual(result["status"], "GREEN")
+        self.assertNotIn("19. **Claude child-session broker", self.agents_doc.read_text())
+
+
+class ApplyAllCliTests(ApplyAllFixtureMixin, unittest.TestCase):
+    def test_apply_all_and_apply_are_mutually_exclusive(self):
+        config_path = pathlib.Path(self.tmp.name) / "disabled-child-broker.json"
+        config_path.write_text(json.dumps(self.config))
+        with self.assertRaises(SystemExit):
+            tool.main(["--config", str(config_path), "--apply", "--apply-all"])
+
+    def test_cli_apply_all_integrates_both_waves(self):
+        config_path = pathlib.Path(self.tmp.name) / "disabled-child-broker.json"
+        config_path.write_text(json.dumps(self.config))
+        code = tool.main(["--config", str(config_path), "--apply-all"])
+        self.assertEqual(code, 0)
+        self.assertEqual(tool.check(self.config)["status"], "GREEN")
+        self.assertEqual(tool.check_projection(self.config)["status"], "GREEN")
+
+
 if __name__ == "__main__":
     unittest.main()
