@@ -1631,6 +1631,44 @@ class VerifierDiagnosticsTests(unittest.TestCase):
         self.verifier_path.write_text("print('all good')\n")
         tool._run_verifier_readonly(self._config())  # must not raise
 
+    def test_verifier_failure_preserves_fail_line_buried_in_long_stdout(self):
+        # Regression for a real live-apply denial: the verifier prints one
+        # [FAIL] line near the TOP of its output, followed by thousands of
+        # [PASS] lines. A tail-only bound keeps only the end of the output,
+        # so the actual failing check silently disappears from the DENY
+        # message even though the message looks "full" of real content.
+        script_lines = [
+            "print('[FAIL] POLICY-99 the real failing check detail xyz')",
+        ]
+        script_lines += [f"print('[PASS] filler check number {i}')" for i in range(2000)]
+        script_lines.append("import sys; sys.exit(1)")
+        self.verifier_path.write_text("\n".join(script_lines) + "\n")
+
+        with self.assertRaises(tool.VerifierFailed) as ctx:
+            tool._run_verifier_readonly(self._config())
+        message = str(ctx.exception)
+        self.assertIn("[FAIL] POLICY-99 the real failing check detail xyz", message)
+        self.assertLess(len(message), 10000)  # still bounded overall
+
+    def test_verifier_failure_stderr_stays_tail_only_when_oversized(self):
+        # stderr behavior must stay exactly as before: plain tail-bounded,
+        # no [FAIL]-line extraction (the verifier's own diagnostics live on
+        # stdout; stderr is for unexpected tracebacks/crash noise).
+        script_lines = [
+            "import sys",
+            "print('[FAIL] should not be specially preserved on stderr', file=sys.stderr)",
+        ]
+        script_lines += [f"print('filler stderr line {i}', file=sys.stderr)" for i in range(2000)]
+        script_lines.append("sys.exit(1)")
+        self.verifier_path.write_text("\n".join(script_lines) + "\n")
+
+        with self.assertRaises(tool.VerifierFailed) as ctx:
+            tool._run_verifier_readonly(self._config())
+        message = str(ctx.exception)
+        self.assertNotIn("[FAIL] should not be specially preserved on stderr", message)
+        self.assertIn("filler stderr line 1999", message)  # tail is preserved
+        self.assertLess(len(message), 10000)
+
 
 if __name__ == "__main__":
     unittest.main()
