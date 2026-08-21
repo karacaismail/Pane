@@ -1562,5 +1562,75 @@ class DefaultLaunchdOpsTests(unittest.TestCase):
                 ops["bootstrap"]("/fixture/x.plist")
 
 
+class VerifierDiagnosticsTests(unittest.TestCase):
+    """_run_verifier_readonly() must surface WHY the verifier rejected the
+    change, not just its exit code -- the real verify_worker_policy.py
+    prints its [FAIL]/diagnostic detail to stdout, not stderr, so a message
+    built from stderr alone is silently empty on a real failure."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.verifier_path = pathlib.Path(self.tmp.name) / "fake_verifier.py"
+
+    def _config(self):
+        return {"surfaces": {"verifier": {"path": str(self.verifier_path)}}}
+
+    def test_verifier_failure_preserves_stdout_diagnostics(self):
+        self.verifier_path.write_text(
+            "import sys\n"
+            "print('DIAGNOSTIC-STDOUT: POLICY-99 mismatch detail xyz')\n"
+            "sys.exit(1)\n"
+        )
+        with self.assertRaises(tool.VerifierFailed) as ctx:
+            tool._run_verifier_readonly(self._config())
+        self.assertIn("DIAGNOSTIC-STDOUT: POLICY-99 mismatch detail xyz", str(ctx.exception))
+
+    def test_verifier_failure_preserves_stderr_diagnostics(self):
+        self.verifier_path.write_text(
+            "import sys\n"
+            "print('DIAGNOSTIC-STDERR: traceback-like detail', file=sys.stderr)\n"
+            "sys.exit(1)\n"
+        )
+        with self.assertRaises(tool.VerifierFailed) as ctx:
+            tool._run_verifier_readonly(self._config())
+        self.assertIn("DIAGNOSTIC-STDERR: traceback-like detail", str(ctx.exception))
+
+    def test_verifier_failure_preserves_both_stdout_and_stderr(self):
+        self.verifier_path.write_text(
+            "import sys\n"
+            "print('OUT-PART: from stdout')\n"
+            "print('ERR-PART: from stderr', file=sys.stderr)\n"
+            "sys.exit(1)\n"
+        )
+        with self.assertRaises(tool.VerifierFailed) as ctx:
+            tool._run_verifier_readonly(self._config())
+        message = str(ctx.exception)
+        self.assertIn("OUT-PART: from stdout", message)
+        self.assertIn("ERR-PART: from stderr", message)
+
+    def test_verifier_failure_diagnostics_are_bounded(self):
+        self.verifier_path.write_text(
+            "print('X' * 200000)\n"
+            "import sys; sys.exit(1)\n"
+        )
+        with self.assertRaises(tool.VerifierFailed) as ctx:
+            tool._run_verifier_readonly(self._config())
+        message = str(ctx.exception)
+        self.assertLess(len(message), 10000)
+
+    def test_verifier_failure_with_no_output_says_so_explicitly(self):
+        self.verifier_path.write_text("import sys\nsys.exit(1)\n")
+        with self.assertRaises(tool.VerifierFailed) as ctx:
+            tool._run_verifier_readonly(self._config())
+        message = str(ctx.exception)
+        self.assertIn("1", message)
+        self.assertNotEqual(message.strip().endswith(":"), True)
+
+    def test_verifier_success_is_unaffected(self):
+        self.verifier_path.write_text("print('all good')\n")
+        tool._run_verifier_readonly(self._config())  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

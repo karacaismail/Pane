@@ -276,6 +276,18 @@ def _update_manifest(config):
     _write_text(manifest_path, "".join(new_lines))
 
 
+_VERIFIER_DIAGNOSTIC_MAX_CHARS = 4000
+
+
+def _bounded_diagnostic(text, max_chars=_VERIFIER_DIAGNOSTIC_MAX_CHARS):
+    """Tail-truncate to a bounded size so a runaway verifier can't blow up
+    the failure message (or, worst case, spray unbounded output into logs)."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return f"...[truncated to last {max_chars} chars]...\n" + text[-max_chars:]
+
+
 def _run_verifier_readonly(config):
     path = config["surfaces"]["verifier"]["path"]
     result = subprocess.run(
@@ -284,9 +296,16 @@ def _run_verifier_readonly(config):
         text=True,
     )
     if result.returncode != 0:
-        raise VerifierFailed(
-            f"verifier {path} exited {result.returncode}: {result.stderr.strip()}"
-        )
+        stdout = _bounded_diagnostic(result.stdout)
+        stderr = _bounded_diagnostic(result.stderr)
+        parts = [f"verifier {path} exited {result.returncode}"]
+        if stdout:
+            parts.append(f"stdout: {stdout}")
+        if stderr:
+            parts.append(f"stderr: {stderr}")
+        if not stdout and not stderr:
+            parts.append("(no output on stdout or stderr)")
+        raise VerifierFailed(" | ".join(parts))
 
 
 def apply(config):
