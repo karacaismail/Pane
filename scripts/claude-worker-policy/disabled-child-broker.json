@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 3,
+  "description": "Git-tracked preparation record for a transactional installer that integrates the disabled Claude child-session broker posture into the four real global policy surfaces (canonical policy, golden policy, verifier, integrity manifest). The local broker module is a read-only prerequisite: this package never rewrites it. A future --apply installs ONLY this disabled posture, atomically across all four surfaces, with prehash checks, backup, idempotency, verifier re-validation, and rollback. The verifier patch is wired into run_all(spec) as a real POLICY-54-style check, not merely defined.",
+  "posture": "strictly-disabled",
+
+  "broker_prerequisite": {
+    "description": "Read-only prerequisite. Never written by this package.",
+    "path": "/Users/karaca/.local/share/codex-claude-bridge/claude_child_broker.py",
+    "expected_sha256": "2c81ff8da66487e17fa8d4e6bfe3c0dc30c9371d15c3a4851276454131f63d2f"
+  },
+
+  "claude_child_broker_object": {
+    "prepared": true,
+    "active": false,
+    "repoHandshakePrepared": false,
+    "paneClaudeExecutionMasterAllowed": false,
+    "defaultDecision": "DENY",
+    "sideEffectsAllowed": false,
+    "workerCreationAllowed": false,
+    "nestedDelegationAllowed": false,
+    "capabilityAccessAllowed": false,
+    "capabilityMintingAllowed": false,
+    "gitAuthority": false,
+    "scopeAuthority": false,
+    "rollbackAuthority": false,
+    "approvalAuthority": false,
+    "promotionAuthority": false,
+    "reviewerWriteAllowed": false,
+    "providerFallbackAllowed": false,
+    "authorizedCreators": ["codex-desktop-master"],
+    "brokerModulePath": "/Users/karaca/.local/share/codex-claude-bridge/claude_child_broker.py",
+    "brokerModuleSha256": "2c81ff8da66487e17fa8d4e6bfe3c0dc30c9371d15c3a4851276454131f63d2f",
+    "brokerTestPath": "/Users/karaca/.local/share/codex-claude-bridge/test_claude_child_broker.py"
+  },
+  "top_level_key": "claudeChildBroker",
+
+  "must_be_false_fields": [
+    "active",
+    "repoHandshakePrepared",
+    "paneClaudeExecutionMasterAllowed",
+    "sideEffectsAllowed",
+    "workerCreationAllowed",
+    "nestedDelegationAllowed",
+    "capabilityAccessAllowed",
+    "capabilityMintingAllowed",
+    "gitAuthority",
+    "scopeAuthority",
+    "rollbackAuthority",
+    "approvalAuthority",
+    "promotionAuthority",
+    "reviewerWriteAllowed",
+    "providerFallbackAllowed"
+  ],
+  "must_equal_fields": {
+    "defaultDecision": "DENY"
+  },
+
+  "verifier_patch": {
+    "function_marker": "# BEGIN claudeChildBroker verifier check (managed by disabled-child-broker.json, do not hand-edit)",
+    "function_end_marker": "# END claudeChildBroker verifier check",
+    "function_insert_before": "def run_all(spec):",
+    "function_template": "# BEGIN claudeChildBroker verifier check (managed by disabled-child-broker.json, do not hand-edit)\ndef check_claude_child_broker(checks, spec):\n    \"\"\"POLICY-54: claudeChildBroker is present in canonical policy and strictly disabled.\"\"\"\n    expected = {expected_literal}\n    cid, target, expectation = \"POLICY-54\", CANONICAL_POLICY, \"claudeChildBroker is present and strictly disabled\"\n    try:\n        live = read_json(CANONICAL_POLICY)\n    except LoadError as exc:\n        checks.append(Check(cid, target, expectation, False, f\"canonical policy unreadable: {{exc}}\"))\n        return\n    obj = live.get(\"claudeChildBroker\")\n    if not isinstance(obj, dict):\n        checks.append(Check(cid, target, expectation, False, \"claudeChildBroker missing or not an object\"))\n        return\n    mismatches = [f\"{{k}}={{obj.get(k)!r}} (want {{v!r}})\" for k, v in expected.items() if obj.get(k) != v]\n    broker_path = Path(expected.get(\"brokerModulePath\", \"\"))\n    broker_ok = broker_path.exists() and sha256_file(broker_path) == expected.get(\"brokerModuleSha256\")\n    if not broker_ok:\n        mismatches.append(\"broker module missing or hash mismatch\")\n    ok = not mismatches\n    checks.append(Check(cid, target, expectation, ok, \"matches expected disabled posture\" if ok else \"; \".join(mismatches)))\n# END claudeChildBroker verifier check\n\n\n",
+    "call_anchor": "check_canonical_policy(checks, spec)",
+    "call_statement": "check_claude_child_broker(checks, spec)  # managed by disabled-child-broker.json (claudeChildBroker, POLICY-54)"
+  },
+
+  "surfaces": {
+    "canonical": {
+      "path": "/Users/karaca/.pane/orchestration/claude-worker-policy.json",
+      "kind": "json_top_level_key",
+      "expected_prehash_sha256": "6256fcde9fb7a1636bef3335f5a038a27a13cd8b22320a2a860465278dec7077"
+    },
+    "golden": {
+      "path": "/Users/karaca/.local/share/codex-claude-bridge/golden/claude-worker-policy.golden.json",
+      "kind": "json_top_level_key",
+      "expected_prehash_sha256": "6256fcde9fb7a1636bef3335f5a038a27a13cd8b22320a2a860465278dec7077"
+    },
+    "verifier": {
+      "path": "/Users/karaca/.local/share/codex-claude-bridge/verify_worker_policy.py",
+      "kind": "python_patch",
+      "expected_prehash_sha256": "516336579150f72e322ae93865b6ea1f468385c4f4f838a6073c21c11e9c0537"
+    },
+    "manifest": {
+      "path": "/Users/karaca/.local/share/codex-claude-bridge/golden/GOLDEN.sha256",
+      "kind": "manifest",
+      "expected_prehash_sha256": "4a038897f7644e656ace89555173f982d9aebb1cf47e60027a34ba681b8caa42",
+      "updatable_entries": [
+        "verify_worker_policy.py",
+        "claude-worker-policy.golden.json"
+      ]
+    }
+  },
+
+  "backup_dir": "/Users/karaca/.local/share/codex-claude-bridge/rollback"
+}
