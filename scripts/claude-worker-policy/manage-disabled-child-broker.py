@@ -560,8 +560,8 @@ def _write_numbered_within_markers(config, target):
     lines = body.splitlines()
     found = _find_item_block(lines, detect)
     if found is not None:
-        start, end, number = found
-        lines[start:end] = _render_item(config, "refusal_body_item_template", number)
+        item_start, item_end, number = found
+        lines[item_start:item_end] = _render_item(config, "refusal_body_item_template", number)
         new_body = "\n".join(lines) + "\n"
         _write_text(path, head + begin + new_body + end + tail)
         return

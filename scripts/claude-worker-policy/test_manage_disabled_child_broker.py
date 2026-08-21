@@ -849,6 +849,50 @@ class ProjectionApplyTests(ProjectionFixtureMixin, unittest.TestCase):
         check_result = tool.check_projection(self.config)
         self.assertEqual(check_result["status"], "GREEN")
 
+    def test_stale_item_within_markers_non_source_mode_replaces_in_place(self):
+        # Regression for manage-disabled-child-broker.py:566 -- a prior
+        # `_write_numbered_within_markers` reused `end` as both the marker
+        # string and (via `start, end, number = found`) the item-block end
+        # index, so concatenating `end` into the new file text raised
+        # TypeError on any *replacement* of an existing stale item inside
+        # begin/end markers (append-only writes never hit this path).
+        stale_item = [
+            "11. **Claude child-session broker is prepared, not active.**",
+            "    stale text from a prior wave.",
+        ]
+        self.live_claude_md.write_text(
+            LIVE_CLAUDE_MD_FIXTURE.replace(
+                "<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:END -->",
+                "\n".join(stale_item) + "\n<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:END -->",
+            )
+        )
+        self.config["projection"]["targets"]["live_claude_md"]["expected_prehash_sha256"] = (
+            tool.sha256_text(self.live_claude_md.read_text())
+        )
+
+        target = self.config["projection"]["targets"]["live_claude_md"]
+        tool._write_numbered_within_markers(self.config, target)
+
+        text = self.live_claude_md.read_text()
+        self.assertEqual(text.count("Claude child-session broker is prepared, not active"), 1)
+        self.assertIn("11. **Claude child-session broker is prepared, not active.**", text)
+        self.assertNotIn("stale text from a prior wave.", text)
+        self.assertIn("<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:END -->", text)
+        self.assertTrue(
+            text.index("11. **Claude child-session broker")
+            < text.index("<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:END -->")
+        )
+
+    def test_stale_item_within_markers_source_path_mode_still_works(self):
+        # source_path mode takes the early-return golden-splice branch, which
+        # never touched the shadowed `end` variable -- confirm it remains
+        # unaffected by the fix.
+        target = self.config["projection"]["targets"]["live_agents_md"]
+        tool._write_numbered_within_markers(self.config, target)
+        text = self.live_agents_md.read_text()
+        self.assertIn(PROVIDER_LOCK_FIXTURE.strip("\n"), text)
+        self.assertEqual(text.count("CLAUDE-WORKER-PROVIDER-LOCK:BEGIN"), 1)
+
     def test_second_apply_after_upsert_is_still_noop(self):
         stale_item = [
             "19. **Claude child-session broker is prepared, not active.**",
