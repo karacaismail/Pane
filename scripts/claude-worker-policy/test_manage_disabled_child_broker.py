@@ -483,6 +483,80 @@ class ApplyModeTests(FixtureMixin, unittest.TestCase):
             tool.apply(self.config)
         self.assertFalse(self.backup_dir.exists())
 
+    def test_stale_marked_function_is_replaced_not_duplicated(self):
+        # Seed the verifier with an already-marked block whose body is from
+        # an earlier config generation (stale expected literal), matching
+        # the "may carry a stale expected literal" case _write_verifier_patch
+        # documents. It must be replaced in place, not appended alongside.
+        patch = self.config["verifier_patch"]
+        stale_block = (
+            patch["function_marker"] + "\n"
+            "def check_claude_child_broker(checks, spec):\n"
+            "    expected = {}  # stale, from an earlier generation\n"
+            "    pass\n"
+            + patch["function_end_marker"] + "\n\n\n"
+        )
+        original = self.verifier_path.read_text()
+        anchor = patch["function_insert_before"]
+        self.assertIn(anchor, original)
+        seeded = original.replace(anchor, stale_block + anchor, 1)
+        self.verifier_path.write_text(seeded)
+        self.config["surfaces"]["verifier"]["expected_prehash_sha256"] = tool.sha256_text(seeded)
+
+        tool._write_verifier_patch(self.config)
+
+        result_text = self.verifier_path.read_text()
+        self.assertEqual(result_text.count(patch["function_marker"]), 1)
+        self.assertEqual(result_text.count(patch["function_end_marker"]), 1)
+        self.assertNotIn("stale, from an earlier generation", result_text)
+        self.assertIn("POLICY-54", result_text)
+
+    def test_orphan_marker_refuses_before_write(self):
+        # Only the begin marker is present (end marker missing entirely):
+        # begin_count=1, end_count=0 falls outside the "neither" (0,0) and
+        # "matched pair" (1,1) cases, so it must be refused, not guessed at.
+        patch = self.config["verifier_patch"]
+        original = self.verifier_path.read_text()
+        seeded = original.replace(
+            patch["function_insert_before"],
+            patch["function_marker"] + "\n" + patch["function_insert_before"],
+            1,
+        )
+        self.verifier_path.write_text(seeded)
+
+        with self.assertRaises(tool.PolicyRefused):
+            tool._write_verifier_patch(self.config)
+        self.assertEqual(self.verifier_path.read_text(), seeded)
+
+    def test_duplicate_begin_marker_refuses_before_write(self):
+        # Two begin markers, one end marker: begin_count=2 is neither (0,0)
+        # nor (1,1), so this must be refused rather than picking a match
+        # arbitrarily and silently corrupting the file.
+        patch = self.config["verifier_patch"]
+        original = self.verifier_path.read_text()
+        doubled_marker = patch["function_marker"] + "\n" + patch["function_marker"] + "\n"
+        seeded = original.replace(
+            patch["function_insert_before"],
+            doubled_marker + patch["function_end_marker"] + "\n" + patch["function_insert_before"],
+            1,
+        )
+        self.verifier_path.write_text(seeded)
+
+        with self.assertRaises(tool.PolicyRefused):
+            tool._write_verifier_patch(self.config)
+        self.assertEqual(self.verifier_path.read_text(), seeded)
+
+    def test_managed_call_statement_appears_exactly_once_after_apply(self):
+        tool.apply(self.config)
+        verifier_text = self.verifier_path.read_text()
+        call_statement = self.config["verifier_patch"]["call_statement"]
+        self.assertEqual(verifier_text.count(call_statement), 1)
+
+        # Re-running apply (no-op path) must not duplicate the call either.
+        tool.apply(self.config)
+        verifier_text_again = self.verifier_path.read_text()
+        self.assertEqual(verifier_text_again.count(call_statement), 1)
+
 
 PROVIDER_LOCK_FIXTURE = (
     "# Provider lock (agents)\n\n"

@@ -222,13 +222,36 @@ def _write_verifier_patch(config):
     patch = config["verifier_patch"]
 
     content = _read_text(path)
+    begin_marker = patch["function_marker"]
+    end_marker = patch["function_end_marker"]
+    begin_count = content.count(begin_marker)
+    end_count = content.count(end_marker)
 
-    if patch["function_marker"] not in content:
+    if begin_count == 0 and end_count == 0:
         anchor = patch["function_insert_before"]
         if anchor not in content:
             raise PolicyRefused(f"verifier function anchor not found: {anchor!r}")
         function_text = render_verifier_function(config)
         content = content.replace(anchor, function_text + anchor, 1)
+    elif begin_count == 1 and end_count == 1:
+        begin_idx = content.index(begin_marker)
+        end_idx = content.index(end_marker)
+        if end_idx < begin_idx:
+            raise PolicyRefused(
+                "verifier managed function block markers are out of order; refusing"
+            )
+        # Replace the existing marked block (which may carry a stale
+        # expected literal from an earlier config generation) with the
+        # current render, in place -- never appending a second block.
+        end_idx_after_marker = end_idx + len(end_marker)
+        rendered = render_verifier_function(config)
+        content = content[:begin_idx] + rendered + content[end_idx_after_marker:]
+    else:
+        raise PolicyRefused(
+            "verifier managed function block markers are malformed: found "
+            f"{begin_count} start marker(s) and {end_count} end marker(s) "
+            "(expected exactly one matched pair, or neither); refusing"
+        )
 
     if patch["call_statement"] not in content:
         call_anchor = patch["call_anchor"]
