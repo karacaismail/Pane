@@ -752,18 +752,198 @@ def apply_projection(config):
     }
 
 
+# --------------------------------------------------------------- apply-all
+#
+# A single atomic transaction that applies both the POLICY-54 core wave and
+# the projection wave from the same initial snapshot: one preflight over the
+# union of every unique target path (shared paths, including GOLDEN.sha256,
+# checked once for hash consistency), one backup directory for the union,
+# one write pass across every target, one merged final manifest, and one
+# verifier run after that final manifest is in place. Any failure restores
+# every union target. A second run, once both waves are integrated, is a
+# no-op with no backup and no write.
+
+
+def _apply_all_manifest_hashes(config):
+    surfaces = config["surfaces"]
+    targets = config["projection"]["targets"]
+    hashes = {}
+    if os.path.exists(surfaces["verifier"]["path"]):
+        hashes["verify_worker_policy.py"] = sha256_file(surfaces["verifier"]["path"])
+    if os.path.exists(surfaces["golden"]["path"]):
+        hashes["claude-worker-policy.golden.json"] = sha256_file(surfaces["golden"]["path"])
+    name_to_path = {
+        "provider-lock-agents.md": targets.get("provider_lock_agents", {}).get("path"),
+        "provider-lock-orchestrator.md": targets.get("provider_lock_orchestrator", {}).get("path"),
+        "managed-fields.golden.json": targets.get("managed_fields_refusal", {}).get("path"),
+    }
+    for name, path in name_to_path.items():
+        if path and os.path.exists(path):
+            hashes[name] = sha256_file(path)
+    return hashes
+
+
+def _update_manifest_all(config):
+    manifest_path = config["surfaces"]["manifest"]["path"]
+    allowed = set(config["surfaces"]["manifest"].get("updatable_entries", []))
+    allowed |= set(config["projection"]["manifest"].get("updatable_entries", []))
+    if not os.path.exists(manifest_path) or not allowed:
+        return
+
+    hashes = {
+        name: digest
+        for name, digest in _apply_all_manifest_hashes(config).items()
+        if name in allowed
+    }
+
+    lines = _read_text(manifest_path).splitlines(keepends=True)
+    new_lines = []
+    for line in lines:
+        stripped = line.rstrip("\n")
+        replaced = False
+        for name, digest in hashes.items():
+            if stripped.endswith(f"  {name}") or stripped.endswith(f" {name}"):
+                new_lines.append(f"{digest}  {name}\n")
+                replaced = True
+                break
+        if not replaced:
+            new_lines.append(line)
+    _write_text(manifest_path, "".join(new_lines))
+
+
+def _apply_all_union_paths(config):
+    """name -> path for every unique target across both waves. Shared paths
+    (GOLDEN.sha256) collapse to a single entry keyed by their first-seen
+    name, so they are prehash-checked, backed up and restored exactly once."""
+    surfaces = config["surfaces"]
+    targets = config["projection"]["targets"]
+    proj_manifest = config["projection"]["manifest"]
+
+    ordered = []
+    for name in SURFACE_ORDER:
+        ordered.append((f"broker:{name}", surfaces[name]["path"]))
+    for name, t in targets.items():
+        ordered.append((f"projection:{name}", t["path"]))
+    ordered.append(("projection:manifest", proj_manifest["path"]))
+
+    unique_paths = {}
+    for name, path in ordered:
+        unique_paths.setdefault(path, name)
+    return unique_paths
+
+
+def _apply_all_expected_prehash(config, path):
+    surfaces = config["surfaces"]
+    targets = config["projection"]["targets"]
+    proj_manifest = config["projection"]["manifest"]
+
+    expected = None
+    for surf in surfaces.values():
+        if surf["path"] == path and "expected_prehash_sha256" in surf:
+            if expected is not None and expected != surf["expected_prehash_sha256"]:
+                raise PolicyRefused(
+                    f"shared target {path} has inconsistent expected hashes across surfaces; refusing"
+                )
+            expected = surf["expected_prehash_sha256"]
+    for t in targets.values():
+        if t["path"] == path and "expected_prehash_sha256" in t:
+            if expected is not None and expected != t["expected_prehash_sha256"]:
+                raise PolicyRefused(
+                    f"shared target {path} has inconsistent expected hashes across surfaces; refusing"
+                )
+            expected = t["expected_prehash_sha256"]
+    if path == proj_manifest["path"] and "expected_prehash_sha256" in proj_manifest:
+        if expected is not None and expected != proj_manifest["expected_prehash_sha256"]:
+            raise PolicyRefused(
+                f"shared target {path} has inconsistent expected hashes across surfaces; refusing"
+            )
+        expected = proj_manifest["expected_prehash_sha256"]
+    return expected
+
+
+def is_apply_all_integrated(config):
+    return is_fully_integrated(config) and is_projection_integrated(config)
+
+
+def apply_all(config):
+    """Atomically apply the POLICY-54 core wave and the projection wave from
+    one initial snapshot: preflight the union of unique target paths (shared
+    paths checked once for consistent expected hashes), hard-refuse drift or
+    an enabling posture before any side effect, one backup directory for the
+    union, write every target, update the shared manifest to its single
+    final merged content, then run the verifier exactly once. Any failure
+    restores every union target. Idempotent once both waves are integrated."""
+    expected_obj = config["claude_child_broker_object"]
+    refuse_if_enabling_object(config, expected_obj)
+    _verify_broker_prerequisite(config)
+
+    if is_apply_all_integrated(config):
+        return {"status": "GREEN", "detail": "already integrated (broker + projection)", "changed": False}
+
+    surfaces = config["surfaces"]
+    key = config["top_level_key"]
+
+    unique_paths = _apply_all_union_paths(config)
+    for path, first_name in unique_paths.items():
+        if not os.path.exists(path):
+            raise PolicyRefused(f"{first_name}: target missing at {path}")
+        expected = _apply_all_expected_prehash(config, path)
+        if expected is None:
+            continue
+        actual = sha256_text(_read_text(path))
+        if actual != expected:
+            raise PrehashMismatch(
+                f"{first_name}: prehash mismatch (expected {expected}, found {actual}); refusing"
+            )
+
+    for name in ("canonical", "golden"):
+        existing = _canonical_state(surfaces[name]["path"], key)
+        if existing is not None:
+            refuse_if_enabling_object(config, existing)
+
+    names_by_path = {p: n for n, p in unique_paths.items()}
+    backup_dir = config["backup_dir"]
+    txn_dir, backups = _backup_set(names_by_path, backup_dir, "applyAll")
+
+    try:
+        _write_canonical_or_golden(config, "canonical")
+        _write_canonical_or_golden(config, "golden")
+        _write_verifier_patch(config)
+        for target in config["projection"]["targets"].values():
+            writer = _WRITERS[target["kind"]]
+            writer(config, target)
+        _update_manifest_all(config)
+        _run_verifier_readonly(config)
+    except Exception:
+        _restore_set(names_by_path, backups)
+        raise
+
+    return {
+        "status": "GREEN",
+        "detail": "broker and projection waves integrated atomically from one snapshot",
+        "changed": True,
+        "backup_dir": txn_dir,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=DEFAULT_CONFIG)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--apply",
         action="store_true",
         help="install the POLICY-54 disabled posture across the four core surfaces",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--apply-projection",
         action="store_true",
         help="install the independent projection wave (provider-lock docs, managed-fields, live files, LaunchAgent)",
+    )
+    mode.add_argument(
+        "--apply-all",
+        action="store_true",
+        help="atomically apply both the POLICY-54 core wave and the projection wave from one snapshot",
     )
     args = parser.parse_args(argv)
 
@@ -774,6 +954,8 @@ def main(argv=None):
             result = apply(config)
         elif args.apply_projection:
             result = apply_projection(config)
+        elif args.apply_all:
+            result = apply_all(config)
         else:
             result = {"broker": check(config), "projection": check_projection(config)}
     except (PolicyRefused, VerifierFailed) as exc:
