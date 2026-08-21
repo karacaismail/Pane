@@ -1,7 +1,10 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -1008,6 +1011,14 @@ class ApplyAllFixtureMixin(FixtureMixin, ProjectionFixtureMixin):
         self.config["projection"] = projection_config
         self.manifest_path = shared_manifest_path
 
+        # Isolate every ApplyAll fixture test from the real LaunchAgent by
+        # default: an unloaded fake means apply_all() never invokes
+        # _default_launchd_ops() or real launchctl unless a test explicitly
+        # overrides self.config["launchd_ops"] (or removes the key to
+        # exercise the true default-ops path under its own subprocess mock).
+        self.launchd_ops = FakeLaunchdOps(initially_loaded=False)
+        self.config["launchd_ops"] = self.launchd_ops.as_dict()
+
 
 class ApplyAllTests(ApplyAllFixtureMixin, unittest.TestCase):
     def test_apply_all_is_green_and_integrates_both_waves_from_one_snapshot(self):
@@ -1123,19 +1134,432 @@ class ApplyAllTests(ApplyAllFixtureMixin, unittest.TestCase):
 
 
 class ApplyAllCliTests(ApplyAllFixtureMixin, unittest.TestCase):
+    def _write_config_json(self, path, config=None):
+        # launchd_ops holds live callables and is never part of the real
+        # on-disk config; CLI tests write the JSON-serializable rest and
+        # inject a fake ops factory instead of ever exercising real
+        # launchctl via the CLI entrypoint.
+        serializable = dict(config if config is not None else self.config)
+        serializable.pop("launchd_ops", None)
+        path.write_text(json.dumps(serializable))
+
     def test_apply_all_and_apply_are_mutually_exclusive(self):
         config_path = pathlib.Path(self.tmp.name) / "disabled-child-broker.json"
-        config_path.write_text(json.dumps(self.config))
+        self._write_config_json(config_path)
         with self.assertRaises(SystemExit):
             tool.main(["--config", str(config_path), "--apply", "--apply-all"])
 
     def test_cli_apply_all_integrates_both_waves(self):
         config_path = pathlib.Path(self.tmp.name) / "disabled-child-broker.json"
-        config_path.write_text(json.dumps(self.config))
-        code = tool.main(["--config", str(config_path), "--apply-all"])
+        self._write_config_json(config_path)
+        with mock.patch.object(tool, "_default_launchd_ops", return_value=self.launchd_ops.as_dict()):
+            code = tool.main(["--config", str(config_path), "--apply-all"])
         self.assertEqual(code, 0)
         self.assertEqual(tool.check(self.config)["status"], "GREEN")
         self.assertEqual(tool.check_projection(self.config)["status"], "GREEN")
+
+    def test_cli_denies_cleanly_on_launchd_op_failure(self):
+        config_path = pathlib.Path(self.tmp.name) / "disabled-child-broker.json"
+        self._write_config_json(config_path)
+        failing_ops = FakeLaunchdOps(initially_loaded=True, bootout_error=tool.LaunchdOpFailed("cli boot boom"))
+        stderr = io.StringIO()
+        with mock.patch.object(tool, "_default_launchd_ops", return_value=failing_ops.as_dict()):
+            with contextlib.redirect_stderr(stderr):
+                code = tool.main(["--config", str(config_path), "--apply-all"])
+        self.assertEqual(code, 1)
+        self.assertIn("DENY:", stderr.getvalue())
+        self.assertIn("cli boot boom", stderr.getvalue())
+        self.assertFalse(os.path.exists(self.backup_dir))
+
+    def test_cli_denies_cleanly_on_apply_all_rollback_failure(self):
+        config_path = pathlib.Path(self.tmp.name) / "disabled-child-broker.json"
+        self._write_config_json(config_path)
+        recovery_error = tool.LaunchdOpFailed("cli recovery boom")
+        failing_ops = FakeLaunchdOps(initially_loaded=True, bootstrap_error_on_calls={1: recovery_error})
+        stderr = io.StringIO()
+        with mock.patch.object(tool, "_default_launchd_ops", return_value=failing_ops.as_dict()):
+            with mock.patch.object(tool, "_update_manifest_all", side_effect=RuntimeError("cli write boom")):
+                with contextlib.redirect_stderr(stderr):
+                    code = tool.main(["--config", str(config_path), "--apply-all"])
+        self.assertEqual(code, 1)
+        self.assertIn("DENY:", stderr.getvalue())
+        self.assertIn("cli write boom", stderr.getvalue())
+        self.assertIn("cli recovery boom", stderr.getvalue())
+
+
+class FakeLaunchdOps:
+    """Injectable launchctl stand-in. Records every call so tests can assert
+    ordering; never touches a real service."""
+
+    def __init__(self, initially_loaded=False, bootout_error=None, bootstrap_error_on_calls=(), event_log=None):
+        self.initially_loaded = initially_loaded
+        self.bootout_error = bootout_error
+        # 1-indexed bootstrap call numbers that should raise bootstrap_error_on_calls[i]
+        self.bootstrap_error_on_calls = dict(bootstrap_error_on_calls)
+        # Pass a shared list to interleave these calls with other events
+        # (e.g. _backup_set) in one strict order assertion.
+        self.calls = event_log if event_log is not None else []
+        self._bootstrap_calls = 0
+
+    def is_loaded(self):
+        self.calls.append("is_loaded")
+        return self.initially_loaded
+
+    def bootout(self):
+        self.calls.append("bootout")
+        if self.bootout_error is not None:
+            raise self.bootout_error
+
+    def bootstrap(self, plist_path):
+        self._bootstrap_calls += 1
+        self.calls.append(f"bootstrap:{plist_path}:{self._bootstrap_calls}")
+        error = self.bootstrap_error_on_calls.get(self._bootstrap_calls)
+        if error is not None:
+            raise error
+
+    def as_dict(self):
+        return {"is_loaded": self.is_loaded, "bootout": self.bootout, "bootstrap": self.bootstrap}
+
+
+class ApplyAllLaunchdQuiescenceTests(ApplyAllFixtureMixin, unittest.TestCase):
+    def test_loaded_service_is_booted_out_before_backup_and_bootstrapped_after_success(self):
+        events = []
+        ops = FakeLaunchdOps(initially_loaded=True, event_log=events)
+        self.config["launchd_ops"] = ops.as_dict()
+
+        # Interleave a "backup" marker into the SAME event list so ordering
+        # against is_loaded/bootout/bootstrap is one strict assertion, not
+        # separately-checked existence facts.
+        real_backup_set = tool._backup_set
+
+        def wrapped_backup_set(*args, **kwargs):
+            events.append("backup")
+            return real_backup_set(*args, **kwargs)
+
+        # subprocess.run is legitimately used by the real read-only verifier
+        # invocation inside apply_all -- only assert launchctl itself (argv[0])
+        # is never invoked, since the injected fake ops must fully replace it.
+        real_run = subprocess.run
+
+        def guarded_run(argv, *args, **kwargs):
+            self.assertNotEqual(argv[0], "launchctl")
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(tool, "_backup_set", side_effect=wrapped_backup_set):
+            with mock.patch.object(subprocess, "run", side_effect=guarded_run):
+                result = tool.apply_all(self.config)
+
+        self.assertEqual(result["status"], "GREEN")
+        self.assertTrue(result["service_was_loaded"])
+        # is_loaded -> bootout -> backup -> (writes/verifier happen between
+        # backup returning and bootstrap being called) -> bootstrap
+        self.assertEqual(
+            events,
+            ["is_loaded", "bootout", "backup", f"bootstrap:{self.plist_path}:1"],
+        )
+        self.assertTrue(os.path.exists(self.backup_dir))
+
+    def test_fixture_default_injection_never_touches_default_ops_or_real_launchctl(self):
+        # Safety regression: the ApplyAllFixtureMixin default injection
+        # (an unloaded FakeLaunchdOps) must fully replace launchctl for
+        # every ordinary ApplyAll fixture test -- _default_launchd_ops()
+        # must never even be constructed, let alone invoke a real command.
+        real_run = subprocess.run
+
+        def guarded_run(argv, *args, **kwargs):
+            self.assertNotEqual(argv[0], "launchctl")
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(
+            tool, "_default_launchd_ops", side_effect=AssertionError("must not construct default ops")
+        ) as ctor:
+            with mock.patch.object(subprocess, "run", side_effect=guarded_run):
+                result = tool.apply_all(self.config)
+
+        ctor.assert_not_called()
+        self.assertEqual(result["status"], "GREEN")
+        self.assertEqual(self.launchd_ops.calls, ["is_loaded"])  # unloaded: bootout/bootstrap never called
+
+    def test_unloaded_service_is_never_booted_out_or_bootstrapped(self):
+        ops = FakeLaunchdOps(initially_loaded=False)
+        self.config["launchd_ops"] = ops.as_dict()
+
+        result = tool.apply_all(self.config)
+
+        self.assertEqual(result["status"], "GREEN")
+        self.assertFalse(result["service_was_loaded"])
+        self.assertEqual(ops.calls, ["is_loaded"])
+
+    def test_bootout_failure_is_fail_closed_zero_backups_zero_writes(self):
+        ops = FakeLaunchdOps(initially_loaded=True, bootout_error=RuntimeError("bootout boom"))
+        self.config["launchd_ops"] = ops.as_dict()
+        original_canonical = self.canonical_path.read_text()
+
+        with self.assertRaises(RuntimeError):
+            tool.apply_all(self.config)
+
+        self.assertEqual(ops.calls, ["is_loaded", "bootout"])
+        self.assertFalse(os.path.exists(self.backup_dir))
+        self.assertEqual(self.canonical_path.read_text(), original_canonical)
+
+    def test_noop_and_refusal_paths_never_touch_launchctl(self):
+        ops = FakeLaunchdOps(initially_loaded=True)
+        self.config["launchd_ops"] = ops.as_dict()
+
+        # prehash-drift refusal
+        self.agents_doc.write_text(PROVIDER_LOCK_FIXTURE + "\ndrift\n")
+        with self.assertRaises(tool.PrehashMismatch):
+            tool.apply_all(self.config)
+        self.assertEqual(ops.calls, [])
+
+        # restore drift, then force the no-op (already-integrated) path
+        self.agents_doc.write_text(PROVIDER_LOCK_FIXTURE)
+        self.config["projection"]["targets"]["provider_lock_agents"]["expected_prehash_sha256"] = (
+            tool.sha256_text(self.agents_doc.read_text())
+        )
+        with mock.patch.object(tool, "is_apply_all_integrated", return_value=True):
+            result = tool.apply_all(self.config)
+        self.assertFalse(result["changed"])
+        self.assertEqual(ops.calls, [])
+
+    def test_default_ops_never_constructed_or_exercised_when_noop(self):
+        # Intentionally un-inject the fixture default to exercise the true
+        # default-ops code path -- but subprocess.run is mocked BEFORE the
+        # call so that even if the no-op guard were broken, no real command
+        # would ever run.
+        del self.config["launchd_ops"]
+        with mock.patch.object(tool, "is_apply_all_integrated", return_value=True):
+            with mock.patch.object(subprocess, "run") as run:
+                result = tool.apply_all(self.config)
+                run.assert_not_called()
+        self.assertFalse(result["changed"])
+
+    def test_write_failure_restores_targets_and_recovers_loaded_service(self):
+        ops = FakeLaunchdOps(initially_loaded=True)
+        self.config["launchd_ops"] = ops.as_dict()
+        original = {
+            "canonical": self.canonical_path.read_text(),
+            "agents_doc": self.agents_doc.read_text(),
+            "plist": self.plist_path.read_text(),
+        }
+
+        with mock.patch.object(tool, "_update_manifest_all", side_effect=RuntimeError("write boom")):
+            with self.assertRaises(RuntimeError) as ctx:
+                tool.apply_all(self.config)
+        self.assertEqual(str(ctx.exception), "write boom")
+
+        self.assertEqual(self.canonical_path.read_text(), original["canonical"])
+        self.assertEqual(self.agents_doc.read_text(), original["agents_doc"])
+        self.assertEqual(self.plist_path.read_text(), original["plist"])
+        self.assertEqual(
+            ops.calls,
+            ["is_loaded", "bootout", f"bootstrap:{self.plist_path}:1"],
+        )
+
+    def test_bootstrap_after_success_failure_rolls_back_and_recovers(self):
+        first_error = tool.LaunchdOpFailed("bootstrap after success failed")
+        ops = FakeLaunchdOps(initially_loaded=True, bootstrap_error_on_calls={1: first_error})
+        self.config["launchd_ops"] = ops.as_dict()
+        original = {
+            "canonical": self.canonical_path.read_text(),
+            "agents_doc": self.agents_doc.read_text(),
+        }
+
+        with self.assertRaises(tool.LaunchdOpFailed) as ctx:
+            tool.apply_all(self.config)
+        self.assertIs(ctx.exception, first_error)
+
+        # writes must be rolled back even though they succeeded, because the
+        # post-success bootstrap failed
+        self.assertEqual(self.canonical_path.read_text(), original["canonical"])
+        self.assertEqual(self.agents_doc.read_text(), original["agents_doc"])
+        # recovery bootstrap attempted (2nd call) and this one succeeds
+        self.assertEqual(len(ops.calls), 4)
+        self.assertEqual(ops.calls[0], "is_loaded")
+        self.assertEqual(ops.calls[1], "bootout")
+        self.assertTrue(ops.calls[2].endswith(":1"))
+        self.assertTrue(ops.calls[3].endswith(":2"))
+
+    def test_write_failure_plus_service_recovery_failure_raises_one_compound_error(self):
+        recovery_error = tool.LaunchdOpFailed("recovery bootstrap also failed")
+        ops = FakeLaunchdOps(initially_loaded=True, bootstrap_error_on_calls={1: recovery_error})
+        self.config["launchd_ops"] = ops.as_dict()
+        original_exc = RuntimeError("original write boom")
+
+        with mock.patch.object(tool, "_update_manifest_all", side_effect=original_exc):
+            with self.assertRaises(tool.ApplyAllRollbackFailure) as ctx:
+                tool.apply_all(self.config)
+
+        message = str(ctx.exception)
+        self.assertIn("original write boom", message)
+        self.assertIn("recovery bootstrap also failed", message)
+        self.assertIs(ctx.exception.__cause__, original_exc)
+
+    def test_restore_union_no_early_abort_continues_past_individual_failures(self):
+        names_by_path = {"a": "/tmp/fake-a", "b": "/tmp/fake-b", "c": "/tmp/fake-c"}
+        backups = {"a": "/tmp/backup-a", "b": "/tmp/backup-b", "c": "/tmp/backup-c"}
+
+        def fake_copy2(src, dst):
+            if dst == "/tmp/fake-b":
+                raise OSError("disk full")
+
+        with mock.patch.object(shutil, "copy2", side_effect=fake_copy2) as copy2:
+            errors = tool._restore_union_no_early_abort(names_by_path, backups)
+            self.assertEqual(copy2.call_count, 3)  # a and c still attempted despite b failing
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("b", errors[0])
+        self.assertIn("disk full", errors[0])
+
+    def test_recover_apply_all_failure_aggregates_restore_and_service_errors(self):
+        original_exc = RuntimeError("original cause")
+        ops = FakeLaunchdOps(initially_loaded=True, bootstrap_error_on_calls={1: RuntimeError("svc down")})
+
+        with mock.patch.object(
+            tool, "_restore_union_no_early_abort", return_value=["target-x: boom"]
+        ):
+            with self.assertRaises(tool.ApplyAllRollbackFailure) as ctx:
+                tool._recover_apply_all_failure(
+                    self.config, {}, {}, True, ops.as_dict(), original_exc
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("original cause", message)
+        self.assertIn("target-x: boom", message)
+        self.assertIn("svc down", message)
+        self.assertIs(ctx.exception.__cause__, original_exc)
+
+    def test_recover_apply_all_failure_reraises_original_when_recovery_clean(self):
+        original_exc = RuntimeError("clean original cause")
+        ops = FakeLaunchdOps(initially_loaded=False)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            tool._recover_apply_all_failure(self.config, {}, {}, False, ops.as_dict(), original_exc)
+        self.assertIs(ctx.exception, original_exc)
+        self.assertEqual(ops.calls, [])  # unloaded service: no recovery bootstrap attempted
+
+    def test_backup_set_failure_after_bootout_recovers_service_without_target_restore(self):
+        ops = FakeLaunchdOps(initially_loaded=True)
+        self.config["launchd_ops"] = ops.as_dict()
+        original_canonical = self.canonical_path.read_text()
+
+        with mock.patch.object(tool, "_backup_set", side_effect=RuntimeError("backup boom")):
+            with self.assertRaises(RuntimeError) as ctx:
+                tool.apply_all(self.config)
+        self.assertEqual(str(ctx.exception), "backup boom")
+
+        # zero writes: nothing was ever written because backup itself failed
+        self.assertEqual(self.canonical_path.read_text(), original_canonical)
+        self.assertFalse(os.path.exists(self.backup_dir))
+        # service was booted out, then recovered -- no target restore attempted
+        self.assertEqual(
+            ops.calls,
+            ["is_loaded", "bootout", f"bootstrap:{self.plist_path}:1"],
+        )
+
+    def test_recover_apply_all_service_only_raises_compound_on_recovery_failure(self):
+        original_exc = RuntimeError("original backup cause")
+        ops = FakeLaunchdOps(initially_loaded=True, bootstrap_error_on_calls={1: RuntimeError("svc still down")})
+
+        with self.assertRaises(tool.ApplyAllRollbackFailure) as ctx:
+            tool._recover_apply_all_service_only(self.config, True, ops.as_dict(), original_exc)
+
+        message = str(ctx.exception)
+        self.assertIn("original backup cause", message)
+        self.assertIn("svc still down", message)
+        self.assertIs(ctx.exception.__cause__, original_exc)
+
+    def test_recover_apply_all_service_only_reraises_when_unloaded(self):
+        original_exc = RuntimeError("clean cause")
+        ops = FakeLaunchdOps(initially_loaded=False)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            tool._recover_apply_all_service_only(self.config, False, ops.as_dict(), original_exc)
+        self.assertIs(ctx.exception, original_exc)
+        self.assertEqual(ops.calls, [])
+
+
+class DefaultLaunchdOpsTests(unittest.TestCase):
+    """Direct, fully-mocked coverage of _default_launchd_ops(): every test
+    here patches subprocess.run so it NEVER invokes a real launchctl
+    command, real or otherwise."""
+
+    def _ops(self):
+        return tool._default_launchd_ops()
+
+    @staticmethod
+    def _result(code, stderr=""):
+        return type("FakeCompletedProcess", (), {"returncode": code, "stdout": "", "stderr": stderr})()
+
+    def test_is_loaded_true_on_exit_0(self):
+        ops = self._ops()
+        with mock.patch.object(subprocess, "run", return_value=self._result(0)) as run:
+            self.assertTrue(ops["is_loaded"]())
+            self.assertEqual(run.call_args[0][0][0], "launchctl")
+
+    def test_is_loaded_false_on_exit_113(self):
+        ops = self._ops()
+        with mock.patch.object(subprocess, "run", return_value=self._result(113)):
+            self.assertFalse(ops["is_loaded"]())
+
+    def test_is_loaded_denies_on_unknown_exit(self):
+        ops = self._ops()
+        with mock.patch.object(subprocess, "run", return_value=self._result(37, "weird")):
+            with self.assertRaises(tool.LaunchdOpFailed):
+                ops["is_loaded"]()
+
+    def test_bootout_succeeds_immediately_on_exit_0_no_followup_probe(self):
+        ops = self._ops()
+        with mock.patch.object(subprocess, "run", return_value=self._result(0)) as run:
+            ops["bootout"]()
+            self.assertEqual(run.call_count, 1)
+
+    def test_bootout_tolerates_nonzero_when_followup_probe_confirms_unloaded(self):
+        ops = self._ops()
+        results = [self._result(1, "already gone"), self._result(113)]
+        with mock.patch.object(subprocess, "run", side_effect=results) as run:
+            ops["bootout"]()  # must not raise
+            self.assertEqual(run.call_count, 2)
+
+    def test_bootout_denies_when_followup_probe_confirms_still_loaded(self):
+        ops = self._ops()
+        results = [self._result(1, "denied"), self._result(0)]
+        with mock.patch.object(subprocess, "run", side_effect=results):
+            with self.assertRaises(tool.LaunchdOpFailed):
+                ops["bootout"]()
+
+    def test_bootout_denies_when_followup_probe_itself_unknown(self):
+        ops = self._ops()
+        results = [self._result(1, "denied"), self._result(99, "??")]
+        with mock.patch.object(subprocess, "run", side_effect=results):
+            with self.assertRaises(tool.LaunchdOpFailed):
+                ops["bootout"]()
+
+    def test_bootstrap_succeeds_immediately_on_exit_0_no_followup_probe(self):
+        ops = self._ops()
+        with mock.patch.object(subprocess, "run", return_value=self._result(0)) as run:
+            ops["bootstrap"]("/fixture/x.plist")
+            self.assertEqual(run.call_count, 1)
+
+    def test_bootstrap_tolerates_nonzero_when_followup_probe_confirms_loaded(self):
+        ops = self._ops()
+        results = [self._result(1, "already loaded"), self._result(0)]
+        with mock.patch.object(subprocess, "run", side_effect=results):
+            ops["bootstrap"]("/fixture/x.plist")  # must not raise
+
+    def test_bootstrap_denies_when_followup_probe_confirms_still_unloaded(self):
+        ops = self._ops()
+        results = [self._result(1, "denied"), self._result(113)]
+        with mock.patch.object(subprocess, "run", side_effect=results):
+            with self.assertRaises(tool.LaunchdOpFailed):
+                ops["bootstrap"]("/fixture/x.plist")
+
+    def test_bootstrap_denies_when_followup_probe_itself_unknown(self):
+        ops = self._ops()
+        results = [self._result(1, "denied"), self._result(55)]
+        with mock.patch.object(subprocess, "run", side_effect=results):
+            with self.assertRaises(tool.LaunchdOpFailed):
+                ops["bootstrap"]("/fixture/x.plist")
 
 
 if __name__ == "__main__":

@@ -865,14 +865,164 @@ def is_apply_all_integrated(config):
     return is_fully_integrated(config) and is_projection_integrated(config)
 
 
+# ------------------------------------------------------- launchd quiescence
+#
+# apply_all() writes a target the LaunchAgent watches (com.codex.claude-
+# worker-policy), so a watcher could observe a partially-written union mid-
+# transaction. To avoid that, apply_all() boots the service out before the
+# backup/write phase (only if it was actually loaded) and bootstraps it back
+# in only after everything -- writes, verifier, manifest -- has succeeded.
+# An initially-unloaded service is never touched by launchctl and stays
+# unloaded on every path, success or failure.
+
+LAUNCHD_LABEL = "com.codex.claude-worker-policy"
+
+
+class LaunchdOpFailed(Exception):
+    """Raised when a launchctl bootout/bootstrap/probe operation fails."""
+
+
+class ApplyAllRollbackFailure(Exception):
+    """Raised when apply_all() fails and restoring the union of targets
+    and/or recovering the LaunchAgent service also failed. Aggregates the
+    original cause with every restore/recovery error encountered; nothing
+    is swallowed."""
+
+
+def _default_launchd_ops():
+    """Real launchctl-backed ops, used only outside of tests. Tests must
+    always inject config["launchd_ops"] and never exercise this path.
+
+    `is_loaded` is strict about `launchctl print` exit codes: 0 means loaded,
+    113 is launchd's documented "no such service" code and means unloaded,
+    and any other exit code is an unknown probe failure that DENYs (raises
+    LaunchdOpFailed) rather than guessing. `bootout`/`bootstrap` tolerate a
+    nonzero command exit only when a follow-up strict `is_loaded` probe
+    proves the operation's desired end state was actually reached (e.g. the
+    service was already unloaded when bootout ran); an unknown follow-up
+    probe failure still DENYs."""
+    uid = os.getuid()
+    domain = f"gui/{uid}"
+
+    def is_loaded():
+        result = subprocess.run(
+            ["launchctl", "print", f"{domain}/{LAUNCHD_LABEL}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return True
+        if result.returncode == 113:
+            return False
+        raise LaunchdOpFailed(
+            f"launchctl print unknown exit {result.returncode}: {result.stderr.strip()}"
+        )
+
+    def bootout():
+        result = subprocess.run(
+            ["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return
+        if not is_loaded():
+            return  # desired end state (unloaded) reached despite nonzero exit
+        raise LaunchdOpFailed(f"launchctl bootout failed: {result.stderr.strip()}")
+
+    def bootstrap(plist_path):
+        result = subprocess.run(
+            ["launchctl", "bootstrap", domain, plist_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return
+        if is_loaded():
+            return  # desired end state (loaded) reached despite nonzero exit
+        raise LaunchdOpFailed(f"launchctl bootstrap failed: {result.stderr.strip()}")
+
+    return {"is_loaded": is_loaded, "bootout": bootout, "bootstrap": bootstrap}
+
+
+def _restore_union_no_early_abort(names_by_path, backups):
+    """Restore every union target, continuing past individual failures
+    instead of aborting on the first one. Returns the list of per-target
+    error strings (empty if every restore succeeded)."""
+    errors = []
+    for name, path in names_by_path.items():
+        try:
+            shutil.copy2(backups[name], path)
+        except Exception as exc:
+            errors.append(f"{name} ({path}): {exc}")
+    return errors
+
+
+def _recover_apply_all_failure(config, names_by_path, backups, was_loaded, ops, original_exc):
+    """Shared failure path for both a write/verifier failure and a
+    bootstrap-after-success failure: restore every union target without
+    early abort, then (only if the service was initially loaded) restore
+    it using the just-restored plist. Raises one compound failure if any
+    restore or the service recovery itself failed; otherwise re-raises the
+    original exception unchanged."""
+    restore_errors = _restore_union_no_early_abort(names_by_path, backups)
+
+    service_error = None
+    if was_loaded:
+        plist_path = config["projection"]["targets"]["launch_agent_plist"]["path"]
+        try:
+            ops["bootstrap"](plist_path)
+        except Exception as exc:
+            service_error = str(exc)
+
+    if restore_errors or service_error:
+        parts = [f"original failure: {original_exc}"]
+        if restore_errors:
+            parts.append("restore failures: " + "; ".join(restore_errors))
+        if service_error:
+            parts.append(f"service recovery failure: {service_error}")
+        raise ApplyAllRollbackFailure("; ".join(parts)) from original_exc
+
+    raise original_exc
+
+
+def _recover_apply_all_service_only(config, was_loaded, ops, original_exc):
+    """Failure path for a backup-phase failure: no target was ever written
+    (the backup itself is what failed), so there is nothing to restore --
+    only an initially-loaded service is recovered, using the still-original
+    (untouched) plist. Raises one compound failure if that recovery itself
+    failed; otherwise re-raises the original exception unchanged."""
+    service_error = None
+    if was_loaded:
+        plist_path = config["projection"]["targets"]["launch_agent_plist"]["path"]
+        try:
+            ops["bootstrap"](plist_path)
+        except Exception as exc:
+            service_error = str(exc)
+
+    if service_error:
+        raise ApplyAllRollbackFailure(
+            f"original failure: {original_exc}; service recovery failure: {service_error}"
+        ) from original_exc
+
+    raise original_exc
+
+
 def apply_all(config):
     """Atomically apply the POLICY-54 core wave and the projection wave from
     one initial snapshot: preflight the union of unique target paths (shared
     paths checked once for consistent expected hashes), hard-refuse drift or
     an enabling posture before any side effect, one backup directory for the
     union, write every target, update the shared manifest to its single
-    final merged content, then run the verifier exactly once. Any failure
-    restores every union target. Idempotent once both waves are integrated."""
+    final merged content, then run the verifier exactly once. If the watched
+    LaunchAgent service was loaded, it is booted out before the first backup
+    or write and bootstrapped back in only after the whole transaction
+    (including that bootstrap) succeeds; an initially-unloaded service is
+    never touched. Any write/verifier/bootstrap failure restores every union
+    target (without early abort, aggregating errors) and attempts to
+    recover an initially-loaded service. Idempotent once both waves are
+    integrated -- the no-op and preflight-refusal paths never touch
+    launchctl."""
     expected_obj = config["claude_child_broker_object"]
     refuse_if_enabling_object(config, expected_obj)
     _verify_broker_prerequisite(config)
@@ -901,9 +1051,18 @@ def apply_all(config):
         if existing is not None:
             refuse_if_enabling_object(config, existing)
 
+    ops = config.get("launchd_ops") or _default_launchd_ops()
+    was_loaded = ops["is_loaded"]()
+    if was_loaded:
+        # Fail-closed: a bootout failure means zero backups and zero writes.
+        ops["bootout"]()
+
     names_by_path = {p: n for n, p in unique_paths.items()}
     backup_dir = config["backup_dir"]
-    txn_dir, backups = _backup_set(names_by_path, backup_dir, "applyAll")
+    try:
+        txn_dir, backups = _backup_set(names_by_path, backup_dir, "applyAll")
+    except Exception as exc:
+        _recover_apply_all_service_only(config, was_loaded, ops, exc)
 
     try:
         _write_canonical_or_golden(config, "canonical")
@@ -914,15 +1073,18 @@ def apply_all(config):
             writer(config, target)
         _update_manifest_all(config)
         _run_verifier_readonly(config)
-    except Exception:
-        _restore_set(names_by_path, backups)
-        raise
+        if was_loaded:
+            plist_path = config["projection"]["targets"]["launch_agent_plist"]["path"]
+            ops["bootstrap"](plist_path)
+    except Exception as exc:
+        _recover_apply_all_failure(config, names_by_path, backups, was_loaded, ops, exc)
 
     return {
         "status": "GREEN",
         "detail": "broker and projection waves integrated atomically from one snapshot",
         "changed": True,
         "backup_dir": txn_dir,
+        "service_was_loaded": was_loaded,
     }
 
 
@@ -958,7 +1120,7 @@ def main(argv=None):
             result = apply_all(config)
         else:
             result = {"broker": check(config), "projection": check_projection(config)}
-    except (PolicyRefused, VerifierFailed) as exc:
+    except (PolicyRefused, VerifierFailed, LaunchdOpFailed, ApplyAllRollbackFailure) as exc:
         print(f"DENY: {exc}", file=sys.stderr)
         return 1
 
