@@ -349,26 +349,375 @@ def apply(config):
     }
 
 
+# ------------------------------------------------------------- projection
+#
+# A second, independent transactional wave. It carries the same
+# prepared-not-active broker text into the golden provider-lock docs, the
+# managed-fields golden config (refusal body + launchd requiredWatchPaths),
+# three live managed-content files, and the real LaunchAgent plist. It
+# reuses the same prehash/backup/rollback/idempotency shape as apply()
+# above but targets a disjoint set of files and does not require, and does
+# not re-touch, the POLICY-54 wave.
+
+_NUMBERED_ITEM_RE = None
+
+
+def _numbered_item_re():
+    global _NUMBERED_ITEM_RE
+    if _NUMBERED_ITEM_RE is None:
+        import re
+
+        _NUMBERED_ITEM_RE = re.compile(r"^(\d+)\.\s")
+    return _NUMBERED_ITEM_RE
+
+
+def _next_item_number(lines):
+    """Highest `N. ` line-start seen, plus one. Never trusts an asserted
+    anchor number from config -- always recomputed from live content."""
+    pattern = _numbered_item_re()
+    highest = 0
+    for line in lines:
+        m = pattern.match(line.lstrip("﻿"))
+        if m:
+            highest = max(highest, int(m.group(1)))
+    return highest + 1
+
+
+def _projection_target_present(config, name, target):
+    kind = target["kind"]
+    path = target["path"]
+    if not os.path.exists(path):
+        return False
+    detect = config["projection"]["detection_text"]
+
+    if kind == "numbered_list_append":
+        return detect in _read_text(path)
+
+    if kind == "numbered_list_append_within_markers":
+        text = _read_text(path)
+        if "source_path" in target:
+            # Golden-sync mode: integrated iff the live lock block is byte-
+            # identical (modulo surrounding whitespace) to the golden file.
+            begin, end = target["begin_marker"], target["end_marker"]
+            if begin not in text or end not in text:
+                return False
+            block = text.split(begin, 1)[1].split(end, 1)[0].strip("\n")
+            source_path = target["source_path"]
+            if not os.path.exists(source_path):
+                return False
+            golden = _read_text(source_path).strip("\n")
+            return block == golden and detect in block
+        return detect in text
+
+    if kind == "json_body_array_append":
+        with open(path, "r") as fh:
+            data = json.load(fh)
+        node = data
+        for key in target["json_path"]:
+            node = node.get(key, {})
+        body_text = "\n".join(node) if isinstance(node, list) else ""
+        return detect in body_text
+
+    if kind == "json_array_append_unique":
+        with open(path, "r") as fh:
+            data = json.load(fh)
+        node = data
+        for key in target["json_path"]:
+            node = node.get(key, [])
+        return config["projection"]["watch_path_value"] in (node or [])
+
+    if kind == "plist_watchpath_append":
+        return config["projection"]["watch_path_value"] in _read_text(path)
+
+    raise PolicyRefused(f"unknown projection target kind: {kind}")
+
+
+def is_projection_integrated(config):
+    targets = config["projection"]["targets"]
+    return all(
+        _projection_target_present(config, name, target) for name, target in targets.items()
+    )
+
+
+def check_projection(config):
+    """Read-only report of the projection wave. Never writes."""
+    targets = config["projection"]["targets"]
+    per_target = {
+        name: _projection_target_present(config, name, target)
+        for name, target in targets.items()
+    }
+    manifest_keys = ("provider_lock_agents", "provider_lock_orchestrator", "managed_fields_refusal")
+    manifest_ok = True
+    if all(k in targets for k in manifest_keys):
+        manifest_path = config["projection"]["manifest"]["path"]
+        manifest_ok = False
+        if os.path.exists(manifest_path) and all(os.path.exists(targets[k]["path"]) for k in manifest_keys):
+            manifest_text = _read_text(manifest_path)
+            manifest_ok = all(
+                _manifest_entry_hash(manifest_text, name) == sha256_file(targets[key]["path"])
+                for key, name in (
+                    ("provider_lock_agents", "provider-lock-agents.md"),
+                    ("provider_lock_orchestrator", "provider-lock-orchestrator.md"),
+                    ("managed_fields_refusal", "managed-fields.golden.json"),
+                )
+            )
+    per_target["manifest"] = manifest_ok
+
+    integrated = all(per_target.values())
+    return {
+        "status": "GREEN" if integrated else "RED",
+        "detail": "all projection targets integrated" if integrated else "projection not fully integrated",
+        "targets": per_target,
+    }
+
+
+def _write_numbered_list_append(config, path, template_key):
+    lines = _read_text(path).splitlines()
+    n = _next_item_number(lines)
+    new_item = [line.replace("{n}", str(n)) for line in config["projection"][template_key]]
+    text = _read_text(path)
+    if not text.endswith("\n"):
+        text += "\n"
+    text += "\n".join(new_item) + "\n"
+    _write_text(path, text)
+
+
+def _write_numbered_within_markers(config, target):
+    path = target["path"]
+    text = _read_text(path)
+    begin, end = target["begin_marker"], target["end_marker"]
+    if begin not in text or end not in text:
+        raise PolicyRefused(f"managed block markers not found in {path}")
+    head, rest = text.split(begin, 1)
+    body, tail = rest.split(end, 1)
+
+    if "source_path" in target:
+        # Golden-sync mode: the golden provider-lock file (already updated
+        # with its own new numbered item by this point in the transaction)
+        # is spliced in verbatim, so the live lock block stays byte-for-byte
+        # identical to golden -- no independent numbering, no drift, and no
+        # separate marker block left outside the existing lock markers.
+        source_path = target["source_path"]
+        if not os.path.exists(source_path):
+            raise PolicyRefused(f"projection source missing: {source_path}")
+        golden_text = _read_text(source_path).strip("\n")
+        new_text = head + begin + "\n\n" + golden_text + "\n\n" + end + tail
+        _write_text(path, new_text)
+        return
+
+    lines = body.splitlines()
+    n = _next_item_number(lines)
+    new_item = [line.replace("{n}", str(n)) for line in config["projection"]["refusal_body_item_template"]]
+    new_body = body.rstrip("\n") + "\n" + "\n".join(new_item) + "\n"
+    _write_text(path, head + begin + new_body + end + tail)
+
+
+def _write_json_body_array_append(config, target):
+    path = target["path"]
+    with open(path, "r") as fh:
+        data = json.load(fh)
+    node = data
+    for key in target["json_path"][:-1]:
+        node = node[key]
+    array_key = target["json_path"][-1]
+    body = node[array_key]
+    n = _next_item_number(body)
+    new_item = [line.replace("{n}", str(n)) for line in config["projection"]["refusal_body_item_template"]]
+    node[array_key] = body + new_item
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+
+
+def _write_json_array_append_unique(config, target):
+    path = target["path"]
+    value = config["projection"]["watch_path_value"]
+    with open(path, "r") as fh:
+        data = json.load(fh)
+    node = data
+    for key in target["json_path"][:-1]:
+        node = node[key]
+    array_key = target["json_path"][-1]
+    arr = node.get(array_key, [])
+    if value not in arr:
+        arr = arr + [value]
+    node[array_key] = arr
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+
+
+def _write_plist_watchpath_append(config, target):
+    path = target["path"]
+    value = config["projection"]["watch_path_value"]
+    text = _read_text(path)
+    anchor = "<key>WatchPaths</key>"
+    if anchor not in text:
+        raise PolicyRefused(f"WatchPaths key not found in {path}")
+    if f"<string>{value}</string>" in text:
+        return
+    array_open = text.index("<array>", text.index(anchor))
+    close_tag = "</array>"
+    close_idx = text.index(close_tag, array_open)
+    insertion = f"\t\t<string>{value}</string>\n\t"
+    text = text[:close_idx] + insertion + text[close_idx:]
+    _write_text(path, text)
+
+
+_WRITERS = {
+    "numbered_list_append": lambda config, target: _write_numbered_list_append(
+        config, target["path"], "item_text_template"
+    ),
+    "numbered_list_append_within_markers": _write_numbered_within_markers,
+    "json_body_array_append": _write_json_body_array_append,
+    "json_array_append_unique": _write_json_array_append_unique,
+    "plist_watchpath_append": _write_plist_watchpath_append,
+}
+
+
+def _backup_set(paths_by_name, backup_dir, txn_label):
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    txn_dir = os.path.join(backup_dir, f"{txn_label}.{stamp}")
+    suffix = 0
+    while os.path.exists(txn_dir):
+        suffix += 1
+        txn_dir = os.path.join(backup_dir, f"{txn_label}.{stamp}.{suffix}")
+    os.makedirs(txn_dir)
+    backups = {}
+    for name, path in paths_by_name.items():
+        dst = os.path.join(txn_dir, name)
+        shutil.copy2(path, dst)
+        backups[name] = dst
+    return txn_dir, backups
+
+
+def _restore_set(paths_by_name, backups):
+    for name, path in paths_by_name.items():
+        shutil.copy2(backups[name], path)
+
+
+def _update_projection_manifest(config):
+    manifest_cfg = config["projection"]["manifest"]
+    manifest_path = manifest_cfg["path"]
+    allowed = set(manifest_cfg.get("updatable_entries", []))
+    if not os.path.exists(manifest_path) or not allowed:
+        return
+    targets = config["projection"]["targets"]
+    name_to_path = {
+        "provider-lock-agents.md": targets["provider_lock_agents"]["path"],
+        "provider-lock-orchestrator.md": targets["provider_lock_orchestrator"]["path"],
+        "managed-fields.golden.json": targets["managed_fields_refusal"]["path"],
+    }
+    hashes = {
+        name: sha256_file(path)
+        for name, path in name_to_path.items()
+        if name in allowed and os.path.exists(path)
+    }
+    lines = _read_text(manifest_path).splitlines(keepends=True)
+    new_lines = []
+    for line in lines:
+        stripped = line.rstrip("\n")
+        replaced = False
+        for name, digest in hashes.items():
+            if stripped.endswith(f"  {name}") or stripped.endswith(f" {name}"):
+                new_lines.append(f"{digest}  {name}\n")
+                replaced = True
+                break
+        if not replaced:
+            new_lines.append(line)
+    _write_text(manifest_path, "".join(new_lines))
+
+
+def apply_projection(config):
+    """Atomically install the projection wave across its (disjoint) target
+    set. Idempotent, prehash-checked, backed up as one transaction, and
+    rolled back in full on any failure. Does not run the verifier and does
+    not touch the POLICY-54 wave's surfaces."""
+    if is_projection_integrated(config):
+        return {"status": "GREEN", "detail": "projection already integrated", "changed": False}
+
+    targets = config["projection"]["targets"]
+    manifest_cfg = config["projection"]["manifest"]
+
+    paths_by_name = {name: t["path"] for name, t in targets.items()}
+    paths_by_name["manifest"] = manifest_cfg["path"]
+
+    # De-duplicate: managed-fields.golden.json is targeted twice (refusal
+    # body + watchpaths) but must be prehash-checked and backed up once.
+    unique_paths = {}
+    for name, path in paths_by_name.items():
+        unique_paths.setdefault(path, name)
+
+    for path, first_name in unique_paths.items():
+        if not os.path.exists(path):
+            raise PolicyRefused(f"{first_name}: target missing at {path}")
+        actual = sha256_text(_read_text(path))
+        expected = None
+        for name, t in targets.items():
+            if t["path"] == path and "expected_prehash_sha256" in t:
+                expected = t["expected_prehash_sha256"]
+                break
+        if expected is None and path == manifest_cfg["path"]:
+            expected = manifest_cfg["expected_prehash_sha256"]
+        if expected is not None and actual != expected:
+            raise PrehashMismatch(
+                f"{first_name}: prehash mismatch (expected {expected}, found {actual}); refusing"
+            )
+
+    backup_dir = config["projection"]["backup_dir"]
+    names_by_path = {n: p for p, n in unique_paths.items()}
+    txn_dir, backups = _backup_set(names_by_path, backup_dir, "projection")
+
+    try:
+        for name, target in targets.items():
+            writer = _WRITERS[target["kind"]]
+            writer(config, target)
+        _update_projection_manifest(config)
+    except Exception:
+        _restore_set(names_by_path, backups)
+        raise
+
+    return {
+        "status": "GREEN",
+        "detail": "projection wave integrated across all targets",
+        "changed": True,
+        "backup_dir": txn_dir,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="install the disabled posture across all four surfaces (default is a read-only check)",
+        help="install the POLICY-54 disabled posture across the four core surfaces",
+    )
+    parser.add_argument(
+        "--apply-projection",
+        action="store_true",
+        help="install the independent projection wave (provider-lock docs, managed-fields, live files, LaunchAgent)",
     )
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
 
     try:
-        result = apply(config) if args.apply else check(config)
+        if args.apply:
+            result = apply(config)
+        elif args.apply_projection:
+            result = apply_projection(config)
+        else:
+            result = {"broker": check(config), "projection": check_projection(config)}
     except (PolicyRefused, VerifierFailed) as exc:
         print(f"DENY: {exc}", file=sys.stderr)
         return 1
 
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if result["status"] == "GREEN" else 1
+    if "status" in result:
+        return 0 if result["status"] == "GREEN" else 1
+    return 0 if result["broker"]["status"] == "GREEN" and result["projection"]["status"] == "GREEN" else 1
 
 
 if __name__ == "__main__":

@@ -1,14 +1,12 @@
 {
-  "schemaVersion": 3,
-  "description": "Git-tracked preparation record for a transactional installer that integrates the disabled Claude child-session broker posture into the four real global policy surfaces (canonical policy, golden policy, verifier, integrity manifest). The local broker module is a read-only prerequisite: this package never rewrites it. A future --apply installs ONLY this disabled posture, atomically across all four surfaces, with prehash checks, backup, idempotency, verifier re-validation, and rollback. The verifier patch is wired into run_all(spec) as a real POLICY-54-style check, not merely defined.",
+  "schemaVersion": 4,
+  "description": "Git-tracked preparation record for a transactional installer that integrates the disabled Claude child-session broker posture into the four real global policy surfaces (canonical policy, golden policy, verifier, integrity manifest). The local broker module is a read-only prerequisite: this package never rewrites it. A future --apply installs ONLY this disabled posture, atomically across all four surfaces, with prehash checks, backup, idempotency, verifier re-validation, and rollback. The verifier patch is wired into run_all(spec) as a real POLICY-54-style check, not merely defined. A second, independent `projection` wave (--apply-projection) carries the same prepared-not-active text into the provider-lock golden docs, managed-fields golden config, the three live managed-content files, and the LaunchAgent WatchPaths list -- with its own prehash/backup/rollback/idempotency transaction, separate from and not required for the POLICY-54 wave above.",
   "posture": "strictly-disabled",
-
   "broker_prerequisite": {
     "description": "Read-only prerequisite. Never written by this package.",
     "path": "/Users/karaca/.local/share/codex-claude-bridge/claude_child_broker.py",
     "expected_sha256": "2c81ff8da66487e17fa8d4e6bfe3c0dc30c9371d15c3a4851276454131f63d2f"
   },
-
   "claude_child_broker_object": {
     "prepared": true,
     "active": false,
@@ -27,13 +25,14 @@
     "promotionAuthority": false,
     "reviewerWriteAllowed": false,
     "providerFallbackAllowed": false,
-    "authorizedCreators": ["codex-desktop-master"],
+    "authorizedCreators": [
+      "codex-desktop-master"
+    ],
     "brokerModulePath": "/Users/karaca/.local/share/codex-claude-bridge/claude_child_broker.py",
     "brokerModuleSha256": "2c81ff8da66487e17fa8d4e6bfe3c0dc30c9371d15c3a4851276454131f63d2f",
     "brokerTestPath": "/Users/karaca/.local/share/codex-claude-bridge/test_claude_child_broker.py"
   },
   "top_level_key": "claudeChildBroker",
-
   "must_be_false_fields": [
     "active",
     "repoHandshakePrepared",
@@ -54,7 +53,6 @@
   "must_equal_fields": {
     "defaultDecision": "DENY"
   },
-
   "verifier_patch": {
     "function_marker": "# BEGIN claudeChildBroker verifier check (managed by disabled-child-broker.json, do not hand-edit)",
     "function_end_marker": "# END claudeChildBroker verifier check",
@@ -63,7 +61,6 @@
     "call_anchor": "check_canonical_policy(checks, spec)",
     "call_statement": "check_claude_child_broker(checks, spec)  # managed by disabled-child-broker.json (claudeChildBroker, POLICY-54)"
   },
-
   "surfaces": {
     "canonical": {
       "path": "/Users/karaca/.pane/orchestration/claude-worker-policy.json",
@@ -90,6 +87,107 @@
       ]
     }
   },
-
-  "backup_dir": "/Users/karaca/.local/share/codex-claude-bridge/rollback"
+  "backup_dir": "/Users/karaca/.local/share/codex-claude-bridge/rollback",
+  "projection": {
+    "description": "Independent wave: carries the same prepared-not-active broker text into the golden provider-lock docs, managed-fields golden config, three live managed-content files, and the LaunchAgent WatchPaths. Does not touch or require the POLICY-54 wave above.",
+    "marker": "claude-child-broker-prepared-not-active-projection-m4",
+    "detection_text": "Claude child-session broker is prepared, not active",
+    "item_text_template": [
+      "{n}. **Claude child-session broker is prepared, not active.** The disabled local broker",
+      "   (`/Users/karaca/.local/share/codex-claude-bridge/claude_child_broker.py`) is",
+      "   `active=false`, `repoHandshakePrepared=false`, `defaultDecision=DENY`,",
+      "   `sideEffectsAllowed=false`, `workerCreationAllowed=false`. Preparation is not",
+      "   activation: it opens no worker, capability, Git, scope, rollback, approval,",
+      "   promotion, reviewer-write or provider-fallback authority. Repo handshake and",
+      "   activation remain non-goals until a separate, independently GREEN gate opens them."
+    ],
+    "refusal_body_item_template": [
+      "{n}. **Claude child-session broker is prepared, not active.** The disabled local broker",
+      "    (`/Users/karaca/.local/share/codex-claude-bridge/claude_child_broker.py`) is",
+      "    `active=false`, `repoHandshakePrepared=false`, `defaultDecision=DENY`,",
+      "    `sideEffectsAllowed=false`, `workerCreationAllowed=false`. Preparation is not",
+      "    activation: it opens no worker, capability, Git, scope, rollback, approval,",
+      "    promotion, reviewer-write or provider-fallback authority. Repo handshake and",
+      "    activation remain non-goals until a separate, independently GREEN gate opens them."
+    ],
+    "watch_path_value": "/Users/karaca/.local/share/codex-claude-bridge/claude_child_broker.py",
+    "targets": {
+      "provider_lock_agents": {
+        "kind": "numbered_list_append",
+        "path": "/Users/karaca/.local/share/codex-claude-bridge/golden/provider-lock-agents.md",
+        "anchor_item_number_seen": 18,
+        "manifest_name": "provider-lock-agents.md",
+        "expected_prehash_sha256": "22faa8a047499569adf0102cc2535be51f4414a461128efc7d6bdfe2ebdd4105"
+      },
+      "provider_lock_orchestrator": {
+        "kind": "numbered_list_append",
+        "path": "/Users/karaca/.local/share/codex-claude-bridge/golden/provider-lock-orchestrator.md",
+        "anchor_item_number_seen": 18,
+        "manifest_name": "provider-lock-orchestrator.md",
+        "expected_prehash_sha256": "66ad6eb9d11f17f5209cbb8c50b64c57a530c2c44a38eb5d5e6dd959eb714e71"
+      },
+      "managed_fields_refusal": {
+        "kind": "json_body_array_append",
+        "path": "/Users/karaca/.local/share/codex-claude-bridge/golden/managed-fields.golden.json",
+        "json_path": [
+          "claudeRefusalBlock",
+          "body"
+        ],
+        "anchor_item_number_seen": 11,
+        "manifest_name": "managed-fields.golden.json",
+        "expected_prehash_sha256": "c587ce988ae81d0fba429252694027f5c25c76c1d69167240903b7ebb1952ecf"
+      },
+      "managed_fields_watchpaths": {
+        "kind": "json_array_append_unique",
+        "path": "/Users/karaca/.local/share/codex-claude-bridge/golden/managed-fields.golden.json",
+        "json_path": [
+          "launchd",
+          "requiredWatchPaths"
+        ],
+        "manifest_name": "managed-fields.golden.json",
+        "expected_prehash_sha256": "c587ce988ae81d0fba429252694027f5c25c76c1d69167240903b7ebb1952ecf"
+      },
+      "live_claude_md": {
+        "kind": "numbered_list_append_within_markers",
+        "path": "/Users/karaca/.claude/CLAUDE.md",
+        "begin_marker": "<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:BEGIN -->",
+        "end_marker": "<!-- CLAUDE-WORKER-INVOCATION-ROUTING-LOCK:END -->",
+        "anchor_item_number_seen": 11,
+        "expected_prehash_sha256": "4de13d0a04a0c165457aabc27185f23099d6e18d40e0556b88b30ed5db58b3b1"
+      },
+      "live_agents_md": {
+        "kind": "numbered_list_append_within_markers",
+        "path": "/Users/karaca/.codex/AGENTS.md",
+        "begin_marker": "<!-- CLAUDE-WORKER-PROVIDER-LOCK:BEGIN -->",
+        "end_marker": "<!-- CLAUDE-WORKER-PROVIDER-LOCK:END -->",
+        "source_path": "/Users/karaca/.local/share/codex-claude-bridge/golden/provider-lock-agents.md",
+        "anchor_item_number_seen": 18,
+        "expected_prehash_sha256": "e8e33c7a92833d4ddcfa3d643d68e8c8c1309c5f341ac8dca4be7c37a2388196"
+      },
+      "live_runpane_orchestrator_md": {
+        "kind": "numbered_list_append_within_markers",
+        "path": "/Users/karaca/.pane/skills/pane-chat/runpane-orchestrator.md",
+        "begin_marker": "<!-- CLAUDE-WORKER-PROVIDER-LOCK:BEGIN -->",
+        "end_marker": "<!-- CLAUDE-WORKER-PROVIDER-LOCK:END -->",
+        "source_path": "/Users/karaca/.local/share/codex-claude-bridge/golden/provider-lock-orchestrator.md",
+        "anchor_item_number_seen": 18,
+        "expected_prehash_sha256": "a55d88974e9a63126ef42a57c44df43144d7c4e405ccebc4be85df472110dd0e"
+      },
+      "launch_agent_plist": {
+        "kind": "plist_watchpath_append",
+        "path": "/Users/karaca/Library/LaunchAgents/com.codex.claude-worker-policy.plist",
+        "expected_prehash_sha256": "a4ea02819311d1d9279b4050a78a5e7c1d1db69cc59d4280cc0c6c48d2e13bcb"
+      }
+    },
+    "manifest": {
+      "path": "/Users/karaca/.local/share/codex-claude-bridge/golden/GOLDEN.sha256",
+      "expected_prehash_sha256": "2fe939e26b2add4d363354200dacebc887aed5845fd5d6e710ec38d97eceea82",
+      "updatable_entries": [
+        "provider-lock-agents.md",
+        "provider-lock-orchestrator.md",
+        "managed-fields.golden.json"
+      ]
+    },
+    "backup_dir": "/Users/karaca/.local/share/codex-claude-bridge/rollback"
+  }
 }
