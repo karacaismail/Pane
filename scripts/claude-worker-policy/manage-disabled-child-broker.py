@@ -475,7 +475,10 @@ def _find_item_block(lines, detect):
             start = i
             number = int(m.group(1))
     if start is not None and any(detect in lines[j] for j in range(start, len(lines))):
-        return start, len(lines), number
+        end = len(lines)
+        while end > start and lines[end - 1].strip() == "":
+            end -= 1
+        return start, end, number
     return None
 
 
